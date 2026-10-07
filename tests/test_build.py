@@ -6,7 +6,6 @@ from litewriter import (
     Delete,
     Insert,
     LiteWriter,
-    Replace,
     Select,
     UnionAll,
     Update,
@@ -183,8 +182,6 @@ def test_writes() -> None:
     assert sql(changed) == "UPDATE t SET body = :body WHERE id = :id"
     removed = Delete("t", where=("<", "at", ":before"), returning="id")
     assert sql(removed) == "DELETE FROM t WHERE at < :before RETURNING id"
-    replaced = Replace("t", values={"id": 1, "body": ":body"})
-    assert sql(replaced) == "REPLACE INTO t (id, body) VALUES (1, :body)"
     distinct = Select("id", distinct=True, from_="t")
     assert sql(distinct) == "SELECT DISTINCT id FROM t"
 
@@ -283,6 +280,15 @@ def test_an_expression_has_no_truth_value() -> None:
         bool(col("id") == 1)
 
 
+def test_a_comparison_with_none_raises() -> None:
+    with pytest.raises(WriterError, match="None"):
+        col("deleted_at").__eq__(None)
+    with pytest.raises(WriterError, match="None"):
+        col("n").__lt__(None)
+    assert sql(Select(col("deleted_at").is_(None))) == "SELECT deleted_at IS NULL"
+    assert sql(Select(None)) == "SELECT NULL"
+
+
 def _defines(cls: type, name: str) -> bool:
     for base in cls.__mro__:
         if name in base.__dict__:
@@ -295,7 +301,7 @@ def test_each_statement_has_its_own_methods() -> None:
     assert _defines(Select, "group_by")
     assert not _defines(Select, "values")
     assert _defines(Insert, "values")
-    assert _defines(Replace, "do_nothing")
+    assert _defines(Insert, "do_nothing")
     assert not _defines(Insert, "from_")
     assert _defines(Update, "set")
     assert _defines(Update, "from_")

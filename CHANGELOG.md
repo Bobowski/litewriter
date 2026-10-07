@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0
+
+- `claim` waits on `{path}-claim` so one process can take the file during a switch.
+- `close` folds the WAL once, then drops the claim.
+- `busy_timeout` is seconds. The default is 5.
+- `Replace` is gone. A comparison with `None` raises `WriterError`.
+
 ## 0.1.1
 
 - Windows loops have no `add_reader`. One callback still carries the batch.

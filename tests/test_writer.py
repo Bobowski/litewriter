@@ -319,6 +319,42 @@ async def test_offload_readonly(db: LiteWriter) -> None:
         await db.offload(write_should_fail)
 
 
+def test_busy_timeout_is_seconds(tmp_path: Path) -> None:
+    db = LiteWriter(tmp_path / "busy.sqlite3", busy_timeout=2)
+    db.execute_script(SCHEMA)
+    db.start()
+    assert db.value("PRAGMA busy_timeout") == 2000
+    db.close()
+
+
+def test_busy_timeout_rejects_a_negative(tmp_path: Path) -> None:
+    with pytest.raises(WriterError, match="busy_timeout"):
+        LiteWriter(tmp_path / "busy.sqlite3", busy_timeout=-1)
+
+
+def test_close_folds_the_wal(tmp_path: Path) -> None:
+    path = tmp_path / "fold.sqlite3"
+    db = LiteWriter(path)
+    db.execute_script(SCHEMA)
+    db.start()
+    db.submit(insert, "kept").result(timeout=2)
+    db.close()
+    wal = path.with_name(path.name + "-wal")
+    assert not wal.exists() or wal.stat().st_size == 0
+    reader = LiteWriter(path)
+    assert reader.value("SELECT body FROM t") == "kept"
+    reader.close()
+
+
+def test_close_folds_a_wal_written_before_start(tmp_path: Path) -> None:
+    path = tmp_path / "early.sqlite3"
+    db = LiteWriter(path)
+    db.execute_script(SCHEMA)
+    db.close()
+    wal = path.with_name(path.name + "-wal")
+    assert not wal.exists() or wal.stat().st_size == 0
+
+
 def test_hz_caps_commit_rate(tmp_path: Path) -> None:
     ticks: list[float] = []
 

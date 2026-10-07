@@ -83,22 +83,22 @@ class Expr:
         )
 
     def __eq__(self, other: object) -> Expr:  # pyright: ignore[reportIncompatibleMethodOverride]
-        return _op("=", self, other)
+        return _compare("=", self, other)
 
     def __ne__(self, other: object) -> Expr:  # pyright: ignore[reportIncompatibleMethodOverride]
-        return _op("!=", self, other)
+        return _compare("!=", self, other)
 
     def __lt__(self, other: object) -> Expr:  # pyright: ignore[reportIncompatibleMethodOverride]
-        return _op("<", self, other)
+        return _compare("<", self, other)
 
     def __le__(self, other: object) -> Expr:  # pyright: ignore[reportIncompatibleMethodOverride]
-        return _op("<=", self, other)
+        return _compare("<=", self, other)
 
     def __gt__(self, other: object) -> Expr:  # pyright: ignore[reportIncompatibleMethodOverride]
-        return _op(">", self, other)
+        return _compare(">", self, other)
 
     def __ge__(self, other: object) -> Expr:  # pyright: ignore[reportIncompatibleMethodOverride]
-        return _op(">=", self, other)
+        return _compare(">=", self, other)
 
     def __add__(self, other: object) -> Expr:
         return _op("+", self, other)
@@ -201,6 +201,16 @@ def _leaf(raw: object) -> object:
     return raw
 
 
+def _compare(name: str, left: Expr, right: object) -> Expr:
+    if right is None:
+        raise WriterError(
+            "a comparison with None never matches",
+            help_text="= NULL is unknown. IS NULL matches a missing value.",
+            example='col("deleted_at").is_(None)',
+        )
+    return _op(name, left, right)
+
+
 def _op(name: str, left: object, right: object) -> Expr:
     return Expr((name, _leaf(left), _leaf(right)))
 
@@ -221,7 +231,6 @@ _QUERY = frozenset(
         "intersect",
         "except",
         "insert_into",
-        "replace_into",
         "update",
         "delete_from",
     }

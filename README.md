@@ -107,6 +107,10 @@ A value becomes SQL:
 | `("as", ("lower", "u.name"), "author")` | `lower(u.name) AS author` |
 | `{"select": ["id"], "from": "t"}` | `(SELECT id FROM t)` |
 
+`None` in a value list is `NULL`. `col("deleted_at") == None` raises
+`WriterError`. `= NULL` never matches. `col("deleted_at").is_(None)` is
+`deleted_at IS NULL`. A string literal has no NUL.
+
 A call name that is not an operator is a function. LiteWriter does not
 keep a list of functions. `json_extract`, `datetime`, and a function
 that you register on the connection all work the same way.
@@ -145,7 +149,7 @@ The key order in the dict does not matter. The output uses SQL order.
 | --- | --- |
 | select | `with`, `with_recursive`, `select` or `select_distinct`, `from`, `join`, `where`, `group_by`, `having`, `order_by`, `limit`, `offset` |
 | compound | `union`, `union_all`, `intersect`, or `except` (a list of queries), `order_by`, `limit`, `offset` |
-| insert | `insert_into` or `replace_into`, `columns`, `values` or the select keys, `on_conflict`, `do_nothing`, `do_update_set`, `returning` |
+| insert | `insert_into`, `columns`, `values` or the select keys, `on_conflict`, `do_nothing`, `do_update_set`, `returning` |
 | update | `update`, `set`, `from`, `join`, `where`, `returning` |
 | delete | `delete_from`, `where`, `returning` |
 
@@ -292,15 +296,59 @@ have. A sequence fills `?`. A mapping fills `:name`.
 - `hz=60` is the default. After a commit, the writer sleeps the rest of that 1/60 s.
   When the inbox is empty, the writer parks. `hz=0` commits as fast as
   jobs arrive. You can change `db.hz` while it runs.
+- `busy_timeout=5` is the default. The number is seconds. SQLite waits
+  that long when another connection holds a lock. `0` returns at once.
+  A negative number raises `WriterError`. A number SQLite cannot store
+  raises `WriterError`.
 - `isolated=True` is the default. It sets a SAVEPOINT for that write.
   A failure undoes only that write. The error comes back after the rest
   of the batch commits. `isolated(fn)` does the same thing.
 - `isolated=False` shares the batch. A failure rolls back the whole batch.
   The other writes in that batch get `WriterRolledBack`.
-- `db.close()` drains the inbox, commits the last batch, and stops. A
-  write that arrives too late fails with `WriterRuntime`.
+- `db.close()` drains the inbox, commits the last batch, folds the WAL,
+  and stops. A write that arrives too late fails with `WriterRuntime`.
 - `submit` returns `Slot[R]`, and `call` returns `R`, where `R` is the
   return type of `fn`. Pyright checks the arguments against `fn`.
+
+## Claim
+
+`claim` is how one process takes the file during a switch. The lock
+is a sibling file, `{path}-claim`. SQLite's own locks stay as they are.
+Readers keep working. A process that never claims can still write.
+SQLite still serializes those commits.
+
+`claim=None` is the default. `start` does not claim. `async with`
+does not claim. Several processes can write one file.
+
+Pass `claim=30` when this process must own the file. `start` and
+`async with` then claim, then start the writer. The number is the
+timeout in seconds. `close` folds the WAL, then drops the claim.
+The kernel also drops it when the process dies.
+
+```python
+async with LiteWriter(path, claim=30) as db:
+    db.execute_script(SCHEMA)
+    yield
+```
+
+That block is claim, start, serve, close. The schema runs after the
+writer starts. To run it before the writer thread, claim first:
+
+```python
+db = LiteWriter(path)
+await db.aclaim(timeout=30)
+db.execute_script(SCHEMA)
+db.start()
+```
+
+`db.claim(timeout=30)` is the same wait on the calling thread.
+`await db.aclaim(timeout=30)` runs the wait off the loop. With
+`claim=None`, pass `timeout=` yourself. A second `claim()` does
+nothing while this writer holds the lock. `timeout=0` tries once.
+
+The call raises `WriterBusy` when the wait ends. The context names
+the holder pid when the lock file has one. The process should abort
+before it serves. `close` during the wait ends it with `WriterRuntime`.
 
 ## Reads
 

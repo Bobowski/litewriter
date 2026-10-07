@@ -13,9 +13,12 @@ MMAP_BYTES = 1 << 30
 """Reads map up to this many bytes of the file. No copy, no read syscall."""
 
 
-def connect(path: str | Path, *, readonly: bool = False) -> apsw.Connection:
-    """Open a file with WAL, NORMAL, foreign keys, busy timeout.
+def connect(
+    path: str | Path, *, readonly: bool = False, busy_ms: int = 5000
+) -> apsw.Connection:
+    """Open a file with WAL, NORMAL, foreign keys, and a busy timeout.
 
+    ``busy_ms`` is the SQLite busy timeout in milliseconds.
     The write connection must be created on the writer thread.
     """
     raw = str(path)
@@ -27,12 +30,12 @@ def connect(path: str | Path, *, readonly: bool = False) -> apsw.Connection:
         )
     else:
         connection = apsw.Connection(raw)
-    _pragmas(connection)
+    _pragmas(connection, busy_ms)
     return connection
 
 
-def _pragmas(connection: apsw.Connection) -> None:
-    connection.execute("PRAGMA busy_timeout=5000")
+def _pragmas(connection: apsw.Connection, busy_ms: int) -> None:
+    connection.execute(f"PRAGMA busy_timeout={busy_ms}")
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=NORMAL")
     connection.execute("PRAGMA foreign_keys=ON")

@@ -116,7 +116,6 @@ _KINDS: dict[str, frozenset[str]] = {
         {
             *_SELECT,
             "insert_into",
-            "replace_into",
             "columns",
             "values",
             "on_conflict",
@@ -250,7 +249,7 @@ def _statement(query: Any) -> str:
 
 
 def _kind(q: Clauses) -> str:
-    if "insert_into" in q or "replace_into" in q:
+    if "insert_into" in q:
         return "insert"
     if "update" in q:
         return "update"
@@ -328,11 +327,8 @@ def _compound(q: Clauses, parts: list[str]) -> None:
 
 
 def _insert(q: Clauses, parts: list[str]) -> None:
-    if "insert_into" in q and "replace_into" in q:
-        raise WriterError("use insert_into or replace_into, not both")
-    replace = "replace_into" in q
-    table = _source(q["replace_into" if replace else "insert_into"])
-    head = "REPLACE INTO" if replace else "INSERT INTO"
+    table = _source(q["insert_into"])
+    head = "INSERT INTO"
     selecting = "select" in q or "select_distinct" in q
     if ("values" in q) == selecting:
         raise WriterError(
@@ -363,7 +359,6 @@ def _insert(q: Clauses, parts: list[str]) -> None:
         body = dict(q)
         for key in (
             "insert_into",
-            "replace_into",
             "columns",
             "on_conflict",
             "do_nothing",
@@ -798,6 +793,12 @@ def _case(low: str, args: list[object], parent: int) -> str:
 def _lit(low: str, args: list[object], parent: int) -> str:
     if len(args) != 1 or not isinstance(args[0], str):
         raise WriterError('lit is ["lit", "text"]', context={"arguments": args})
+    if "\x00" in args[0]:
+        raise WriterError(
+            "a string literal has no NUL",
+            help_text="SQLite reads the SQL text up to the first NUL.",
+            example='lit("open")',
+        )
     return "'" + args[0].replace("'", "''") + "'"
 
 

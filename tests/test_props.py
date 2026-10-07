@@ -2,16 +2,18 @@
 
 SQL trees must match SQLite, including the builder. A batch must match
 the isolation rule, and the default is a savepoint. Each thread reads
-on its own connection, including before the writer starts.
+on its own connection, including before the writer starts. Literals,
+names, null tests, timeouts, and a closed file do too.
 """
 
 import operator
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Barrier, BrokenBarrierError, Event, Lock, Thread
+from typing import cast
 
 import apsw
 import pytest
@@ -21,15 +23,20 @@ from hypothesis import strategies as st
 from conftest import SCHEMA
 from litewriter import (
     Delete,
+    Expr,
     Insert,
     LiteWriter,
     Select,
     Tx,
     UnionAll,
     Update,
+    WriterError,
     WriterRolledBack,
+    col,
+    lit,
     sql,
 )
+from litewriter.claim import validate_timeout
 
 _FAST = settings(max_examples=60, deadline=None)
 _DB = settings(
@@ -434,3 +441,377 @@ def test_each_thread_has_its_own_read_connection(
             _probe(idle, expect, threads)
         finally:
             idle.close()
+
+
+_Built = tuple[object, Callable[[int], int]]
+_EXPR_OPS = ("+", "-", "*", "&", "|", "=", "!=", "<", "<=", ">", ">=")
+_CMP_METHODS = ("__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__")
+_OP = {
+    "+": operator.add,
+    "-": operator.sub,
+    "*": operator.mul,
+    "&": operator.and_,
+    "|": operator.or_,
+    "=": operator.eq,
+    "!=": operator.ne,
+    "<": operator.lt,
+    "<=": operator.le,
+    ">": operator.gt,
+    ">=": operator.ge,
+}
+_KEYWORDS = frozenset(word.upper() for word in apsw.keywords)
+_KEYS = frozenset(
+    {
+        "with",
+        "with_recursive",
+        "select",
+        "select_distinct",
+        "from",
+        "join",
+        "where",
+        "group_by",
+        "having",
+        "order_by",
+        "limit",
+        "offset",
+        "union",
+        "union_all",
+        "intersect",
+        "except",
+        "insert_into",
+        "columns",
+        "values",
+        "on_conflict",
+        "do_nothing",
+        "do_update_set",
+        "returning",
+        "update",
+        "set",
+        "delete_from",
+    }
+)
+_CHARS = st.characters(blacklist_categories=("Cs",), blacklist_characters="\x00")
+_NAME = st.from_regex(r"[A-Za-z_][A-Za-z0-9_]{0,12}", fullmatch=True)
+_SECONDS = st.one_of(
+    st.integers(0, 30),
+    st.floats(0, 30, allow_nan=False, allow_infinity=False),
+)
+_BAD_NUMBER = st.one_of(
+    st.just(True),
+    st.just(False),
+    st.just(float("nan")),
+    st.just(float("inf")),
+    st.just(float("-inf")),
+    st.just(10**400),
+    st.none(),
+    st.text(alphabet="abc", max_size=4),
+    st.integers(max_value=-1),
+    st.floats(max_value=-1e-9, allow_nan=False, allow_infinity=False),
+)
+
+
+def _const(value: int) -> _Built:
+    def ev(_n: int) -> int:
+        return value
+
+    return value, ev
+
+
+def _column() -> _Built:
+    return col("n"), lambda n: n
+
+
+def _apply(name: str, left: _Built, right: _Built) -> _Built:
+    fn = _OP[name]
+    lexpr, lfn = left
+    rexpr, rfn = right
+    built = fn(lexpr, rexpr)
+
+    def ev(n: int) -> int:
+        return int(fn(lfn(n), rfn(n)))
+
+    return built, ev
+
+
+def _unary(name: str, child: _Built) -> _Built:
+    expr, fn = child
+    if name == "neg":
+        built: object = -expr if isinstance(expr, Expr) else ("-", expr)
+
+        def ev(n: int) -> int:
+            return -fn(n)
+
+        return built, ev
+    built = +expr if isinstance(expr, Expr) else ("+", expr)
+
+    def ev_pos(n: int) -> int:
+        return fn(n)
+
+    return built, ev_pos
+
+
+def _expr_trees() -> st.SearchStrategy[_Built]:
+    leaf: st.SearchStrategy[_Built] = st.one_of(
+        st.integers(-6, 6).map(_const),
+        st.just(_column()),
+    )
+
+    def extend(inner: st.SearchStrategy[_Built]) -> st.SearchStrategy[_Built]:
+        return st.one_of(
+            st.builds(_apply, st.sampled_from(_EXPR_OPS), inner, inner),
+            st.builds(_unary, st.sampled_from(("neg", "pos")), inner),
+        )
+
+    return st.recursive(leaf, extend, max_leaves=5)
+
+
+def _as_expr(built: _Built) -> tuple[Expr, Callable[[int], int]]:
+    expr, fn = built
+    if isinstance(expr, Expr):
+        return expr, fn
+    return col("n") - col("n") + expr, fn
+
+
+def _memory() -> apsw.Connection:
+    conn = apsw.Connection(":memory:")
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER, body TEXT)")
+    return conn
+
+
+@given(built=_expr_trees(), n=st.integers(-6, 6))
+@_FAST
+def test_an_expression_matches_sqlite(built: _Built, n: int) -> None:
+    expr, fn = _as_expr(built)
+    conn = _memory()
+    try:
+        conn.execute("INSERT INTO t(n) VALUES (?)", (n,))
+        row = conn.execute(sql(Select(expr, from_="t"))).fetchone()
+    finally:
+        conn.close()
+    assert row == (fn(n),)
+    for method in _CMP_METHODS:
+        with pytest.raises(WriterError, match="None"):
+            getattr(expr, method)(None)
+    assert "IS NULL" in sql(Select(expr.is_(None)))
+    assert "IS NOT NULL" in sql(Select(expr.is_not(None)))
+
+
+@given(
+    values=st.lists(st.one_of(st.none(), st.integers(-5, 5)), max_size=8),
+    probe=st.integers(-5, 5),
+)
+@_FAST
+def test_null_tests_match_the_rows(values: list[int | None], probe: int) -> None:
+    conn = _memory()
+    try:
+        for value in values:
+            conn.execute("INSERT INTO t(n) VALUES (?)", (value,))
+        missing = [
+            index for index, value in enumerate(values, start=1) if value is None
+        ]
+        present = [
+            index for index, value in enumerate(values, start=1) if value is not None
+        ]
+        zeros = [index for index, value in enumerate(values, start=1) if value == probe]
+        assert list(
+            conn.execute(sql(Select("id", from_="t", where=col("n").is_(None))))
+        ) == [(index,) for index in missing]
+        assert list(
+            conn.execute(sql(Select("id", from_="t", where=col("n").is_not(None))))
+        ) == [(index,) for index in present]
+        assert (
+            list(conn.execute(sql(Select("id", from_="t", where=("=", "n", None)))))
+            == []
+        )
+        assert list(
+            conn.execute(sql(Select("id", from_="t", where=col("n") == probe)))
+        ) == [(index,) for index in zeros]
+    finally:
+        conn.close()
+
+
+@given(
+    text=st.text(alphabet=_CHARS, max_size=24),
+    blob=st.binary(max_size=16),
+    flag=st.booleans(),
+    number=st.integers(-(10**6), 10**6),
+    point=st.floats(allow_nan=False, allow_infinity=False, width=64),
+)
+@_FAST
+def test_literals_round_trip(
+    text: str, blob: bytes, flag: bool, number: int, point: float
+) -> None:
+    conn = apsw.Connection(":memory:")
+    try:
+        row = conn.execute(
+            sql(Select(lit(text), blob, flag, number, point, None))
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    assert row == (text, blob, int(flag), number, point, None)
+
+
+@given(
+    prefix=st.text(alphabet=_CHARS, max_size=8),
+    suffix=st.text(alphabet=_CHARS, max_size=8),
+)
+@_FAST
+def test_a_nul_in_a_literal_raises(prefix: str, suffix: str) -> None:
+    with pytest.raises(WriterError, match="NUL"):
+        sql(Select(lit(prefix + "\x00" + suffix)))
+
+
+@given(name=_NAME)
+@_FAST
+def test_a_name_round_trips(name: str) -> None:
+    conn = _memory()
+    try:
+        conn.execute(f'CREATE TABLE u("{name}" INTEGER NOT NULL)')
+        conn.execute(f'INSERT INTO u("{name}") VALUES (7)')
+        text = sql(Select(col(name), from_="u"))
+        if name.upper() in _KEYWORDS:
+            assert f'"{name}"' in text
+        assert conn.execute(text).fetchone() == (7,)
+    finally:
+        conn.close()
+
+
+@example("replace_into")
+@given(
+    key=st.text(alphabet="abcdefghijklmnopqrstuvwxyz_", min_size=1, max_size=16).filter(
+        lambda key: key not in _KEYS
+    )
+)
+@_FAST
+def test_an_unknown_key_does_not_render(key: str) -> None:
+    with pytest.raises(WriterError, match="unknown"):
+        sql({"insert_into": "t", "values": [{"body": "a"}], key: 1})
+
+
+@given(
+    original=st.lists(_TEXT, min_size=1, max_size=4),
+    replacement=st.lists(_TEXT, min_size=1, max_size=4),
+)
+@_FAST
+def test_do_update_matches_the_rows(
+    original: list[str], replacement: list[str]
+) -> None:
+    conn = _memory()
+    try:
+        conn.execute(
+            sql(Insert("t", values=[{"body": ("lit", body)} for body in original]))
+        )
+        payload = [
+            {"id": index, "body": ("lit", body)}
+            for index, body in enumerate(replacement, start=1)
+        ]
+        conn.execute(
+            sql(
+                Insert(
+                    "t",
+                    values=payload,
+                    on_conflict=("id",),
+                    do_update={"body": "excluded.body"},
+                )
+            )
+        )
+        expect = list(original)
+        for index, body in enumerate(replacement):
+            if index < len(expect):
+                expect[index] = body
+            else:
+                expect.append(body)
+        got = [row[0] for row in conn.execute("SELECT body FROM t ORDER BY id")]
+        assert got == expect
+    finally:
+        conn.close()
+
+
+def _pragma(tx: Tx) -> int:
+    return int(tx.value("PRAGMA busy_timeout"))
+
+
+@given(seconds=_SECONDS)
+@_DB
+def test_busy_timeout_reaches_every_connection(seconds: float) -> None:
+    expect = round(float(seconds) * 1000)
+    with TemporaryDirectory() as raw:
+        db = LiteWriter(Path(raw) / "t.sqlite3", hz=0, busy_timeout=seconds)
+        db.execute_script(SCHEMA)
+        db.start()
+        try:
+            assert db.value("PRAGMA busy_timeout") == expect
+            assert db.submit(_pragma).result(timeout=2) == expect
+            with db.reader() as reader:
+                assert reader.value("PRAGMA busy_timeout") == expect
+        finally:
+            db.close()
+
+
+@given(
+    bad=st.one_of(
+        _BAD_NUMBER,
+        st.integers(min_value=2_147_484),
+        st.floats(
+            min_value=2_147_484, max_value=1e18, allow_nan=False, allow_infinity=False
+        ),
+    )
+)
+@_FAST
+def test_busy_timeout_rejects_a_bad_value(bad: object) -> None:
+    with pytest.raises(WriterError, match="busy_timeout"):
+        LiteWriter("unused.sqlite3", busy_timeout=cast(float, bad))
+
+
+@given(timeout=_SECONDS)
+@_FAST
+def test_a_claim_timeout_is_a_count_of_seconds(timeout: float) -> None:
+    assert validate_timeout(timeout) == float(timeout)
+
+
+@given(bad=_BAD_NUMBER)
+@_FAST
+def test_a_claim_timeout_rejects_a_bad_value(bad: object) -> None:
+    with pytest.raises(WriterError, match="claim timeout"):
+        validate_timeout(bad)
+
+
+@given(rate=_SECONDS)
+@_FAST
+def test_hz_stores_a_finite_rate(rate: float) -> None:
+    db = LiteWriter("unused.sqlite3", hz=rate)
+    try:
+        assert db.hz == rate
+    finally:
+        db.close()
+
+
+@given(bad=_BAD_NUMBER)
+@_FAST
+def test_hz_rejects_a_bad_rate(bad: object) -> None:
+    with pytest.raises(WriterError, match="hz"):
+        LiteWriter("unused.sqlite3", hz=cast(float, bad))
+
+
+@given(bodies=st.lists(_TEXT, max_size=5))
+@_DB
+def test_close_keeps_the_rows_and_folds_the_wal(bodies: list[str]) -> None:
+    with TemporaryDirectory() as raw:
+        path = Path(raw) / "t.sqlite3"
+        db = LiteWriter(path, hz=0)
+        db.execute_script(SCHEMA)
+        db.start()
+        try:
+            for body in bodies:
+                db.submit(_insert, body).result(timeout=2)
+        finally:
+            db.close()
+        wal = path.with_name(path.name + "-wal")
+        assert not wal.exists() or wal.stat().st_size == 0
+        conn = apsw.Connection(str(path))
+        try:
+            got = [row[0] for row in conn.execute("SELECT body FROM t ORDER BY id")]
+        finally:
+            conn.close()
+        assert got == bodies

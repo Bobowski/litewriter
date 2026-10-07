@@ -10,14 +10,13 @@ from litewriter.build import (
     Insert,
     Intersect,
     Query,
-    Replace,
     Select,
     Union,
     UnionAll,
     Update,
 )
 from litewriter.connect import connect
-from litewriter.errors import WriterError, WriterRolledBack, WriterRuntime
+from litewriter.errors import WriterBusy, WriterError, WriterRolledBack, WriterRuntime
 from litewriter.expr import Expr, col, exists, lit, not_exists, param
 from litewriter.fn import Isolated, Tx, WriteFn, isolated
 from litewriter.q import sql, where
@@ -35,7 +34,6 @@ __all__ = [
     "Outcome",
     "Query",
     "Reader",
-    "Replace",
     "Select",
     "Stats",
     "Tx",
@@ -44,6 +42,7 @@ __all__ = [
     "Update",
     "Watch",
     "WriteFn",
+    "WriterBusy",
     "WriterError",
     "WriterRolledBack",
     "WriterRuntime",

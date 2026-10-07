@@ -484,43 +484,6 @@ class Insert(_InsertBody):
         )
 
 
-class Replace(Insert):
-    """One REPLACE. The arguments match ``Insert``."""
-
-    __slots__ = ()
-
-    def __init__(
-        self,
-        table: object,
-        *,
-        columns: object = None,
-        values: object = None,
-        select: Mapping[str, Any] | None = None,
-        on_conflict: object = None,
-        do_nothing: bool = False,
-        do_update: Mapping[str, object] | None = None,
-        returning: object = None,
-        with_: object = None,
-        recursive: bool = False,
-    ) -> None:
-        Query.__init__(
-            self,
-            _insert_data(
-                "replace_into",
-                table,
-                columns=columns,
-                values=values,
-                select=select,
-                on_conflict=on_conflict,
-                do_nothing=do_nothing,
-                do_update=do_update,
-                returning=returning,
-                with_=with_,
-                recursive=recursive,
-            ),
-        )
-
-
 class Update(_HasFrom, _HasReturning):
     """One UPDATE. ``set`` maps a column to a value."""
 

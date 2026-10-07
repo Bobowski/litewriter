@@ -16,9 +16,13 @@ loop are set in that same wake.
 A connection stays on the thread that opened it. The inbox, each
 result slot, the reader set, and the counters sit under a lock.
 That stays true when the GIL is off.
+
+``claim`` is an optional lock on a sibling file. It does not change
+SQLite's locks. ``close`` drops it after the last commit.
 """
 
 import asyncio
+import math
 import time
 from asyncio import AbstractEventLoop
 from asyncio import Future as AsyncFuture
@@ -31,6 +35,7 @@ from typing import Any, Concatenate
 
 import apsw
 
+from litewriter.claim import Claim, validate_timeout
 from litewriter.connect import Bindings, connect
 from litewriter.errors import WriterError, WriterRolledBack, WriterRuntime
 from litewriter.fn import Isolated, Tx, WriteFn, unwrap
@@ -105,6 +110,49 @@ class Stats:
             )
 
 
+def _tick_rate(value: object) -> None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise WriterError(
+            "hz must be 0 or a positive tick rate",
+            example="LiteWriter(path, hz=60)\nLiteWriter(path, hz=0)  # no floor",
+        )
+    try:
+        rate = float(value)
+    except OverflowError:
+        rate = math.inf
+    if not math.isfinite(rate) or rate < 0:
+        raise WriterError(
+            "hz must be 0 or a positive tick rate",
+            example="LiteWriter(path, hz=60)\nLiteWriter(path, hz=0)  # no floor",
+        )
+
+
+def _busy_ms(timeout: object) -> int:
+    if isinstance(timeout, bool) or not isinstance(timeout, int | float):
+        raise WriterError(
+            "busy_timeout is a number of seconds",
+            example="LiteWriter(path, busy_timeout=5)",
+        )
+    try:
+        seconds = float(timeout)
+    except OverflowError:
+        seconds = math.inf
+    if not math.isfinite(seconds) or seconds < 0:
+        raise WriterError(
+            "busy_timeout must be 0 or greater",
+            help_text="0 returns as soon as the file is busy.",
+            example="LiteWriter(path, busy_timeout=5)",
+        )
+    millis = round(seconds * 1000)
+    if millis > 2_147_483_647:
+        raise WriterError(
+            "busy_timeout is too large",
+            help_text="SQLite stores this timeout in milliseconds.",
+            example="LiteWriter(path, busy_timeout=5)",
+        )
+    return millis
+
+
 def _missing_file() -> WriterRuntime:
     return WriterRuntime(
         "the database file does not exist",
@@ -120,12 +168,13 @@ class _ThreadReads:
     connection is the thread that closes it.
     """
 
-    __slots__ = ("_closed", "_local", "_lock")
+    __slots__ = ("_busy_ms", "_closed", "_local", "_lock")
 
-    def __init__(self) -> None:
+    def __init__(self, busy_ms: int) -> None:
         self._local = local()
         self._lock = Lock()
         self._closed = False
+        self._busy_ms = busy_ms
 
     def open(self) -> None:
         with self._lock:
@@ -142,7 +191,7 @@ class _ThreadReads:
             raise WriterRuntime("the writer is closed")
         if not path.exists():
             raise _missing_file()
-        connection = connect(path, readonly=True)
+        connection = connect(path, readonly=True, busy_ms=self._busy_ms)
         with self._lock:
             if self._closed:
                 connection.close()
@@ -196,6 +245,8 @@ class LiteWriter:
     """Process facade: writer thread + one read connection per OS thread.
 
     A read does not start the writer. The file must already exist.
+    ``claim=30`` claims the file before ``start``. The default is no claim.
+    ``busy_timeout=5`` is the SQLite busy timeout in seconds.
 
     Bootstrap::
 
@@ -208,10 +259,13 @@ class LiteWriter:
         "_after_commit",
         "_armed",
         "_boot_error",
+        "_busy_ms",
         "_by_column",
         "_by_table",
         "_changed_columns",
         "_changed_tables",
+        "_claim",
+        "_claim_timeout",
         "_closing",
         "_effects",
         "_hz",
@@ -248,9 +302,14 @@ class LiteWriter:
         on_error: OnError | None = None,
         profile: bool = False,
         name: str = "writer",
+        claim: float | None = None,
+        busy_timeout: float = 5,
     ) -> None:
         self.path = Path(path)
         self.name = name
+        self._busy_ms = _busy_ms(busy_timeout)
+        self._claim_timeout = None if claim is None else validate_timeout(claim)
+        self._claim = Claim(self.path.with_name(self.path.name + "-claim"))
         self._hz = 60.0
         self.hz = hz
         self._after_commit = after_commit
@@ -273,7 +332,7 @@ class LiteWriter:
         self._watch_ids = 0
         self._thread: Thread | None = None
         self._write: apsw.Connection | None = None
-        self._reads = _ThreadReads()
+        self._reads = _ThreadReads(self._busy_ms)
         self._readers: set[Reader] = set()
         self._readers_lock = Lock()
         self._life = Condition()
@@ -292,17 +351,80 @@ class LiteWriter:
 
     @hz.setter
     def hz(self, value: float) -> None:
-        if value < 0:
-            raise WriterError(
-                "hz must be 0 or a positive tick rate",
-                example="LiteWriter(path, hz=60)\nLiteWriter(path, hz=0)  # no floor",
-            )
+        _tick_rate(value)
         self._hz = value
 
+    def claim(self, timeout: float | None = None) -> None:
+        """Block until this process holds the claim.
+
+        The lock file is ``{path}-claim``. It is not a SQLite lock.
+        Readers keep working. A process that never claims can still write.
+
+        ``timeout`` is seconds. ``0`` tries once. When the constructor
+        ``claim`` is set, that value is the default. The call raises
+        ``WriterBusy`` when the wait ends. A second call does nothing
+        while this writer holds the lock. ``close`` releases it after
+        the last commit. The kernel also releases it when the process dies.
+        """
+        self._claim.acquire(self._resolve_claim_timeout(timeout))
+
+    async def aclaim(self, timeout: float | None = None) -> None:
+        """Claim the file. The wait runs off this loop. See ``claim``."""
+        timeout = self._resolve_claim_timeout(timeout)
+        taken: list[bool] = []
+        loop = asyncio.get_running_loop()
+        finished = asyncio.Event()
+        box: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                self._claim.acquire(timeout, taken)
+            except BaseException as exc:
+                box.append(exc)
+            loop.call_soon_threadsafe(finished.set)
+
+        Thread(target=run, name="litewriter-aclaim", daemon=True).start()
+        try:
+            await finished.wait()
+        except asyncio.CancelledError:
+            self._claim.abort()
+            if taken:
+                self._claim.release()
+            raise
+        if box:
+            raise box[0]
+
+    def _resolve_claim_timeout(self, timeout: float | None) -> float:
+        if timeout is None:
+            timeout = self._claim_timeout
+        if timeout is None:
+            raise WriterError(
+                "claim needs a timeout",
+                help_text="Pass timeout in seconds, or set claim= on the writer.",
+                example="db.claim(timeout=30)",
+            )
+        return validate_timeout(timeout)
+
     def start(self) -> None:
+        took = False
+        if self._claim_timeout is not None:
+            took = self._claim.acquire(self._claim_timeout)
+        try:
+            self._boot()
+        except BaseException:
+            if took:
+                self._claim.release()
+            raise
+
+    def _boot(self) -> None:
         with self._life:
             while self._joining:
                 self._life.wait()
+            if self._claim_timeout is not None and not self._claim.held():
+                raise WriterRuntime(
+                    "the writer closed before the claim was kept",
+                    help_text="close() releases the claim.",
+                )
             if self._thread is not None:
                 raise WriterRuntime("writer is already started")
             self._closing = False
@@ -327,7 +449,31 @@ class LiteWriter:
                 ) from self._boot_error
 
     def close(self) -> None:
-        """Drain the inbox, COMMIT the last batch, then stop the writer."""
+        """Drain the inbox, COMMIT the last batch, then stop the writer.
+
+        The WAL is folded after that commit. The claim drops after the fold.
+        """
+        self._claim.abort()
+        try:
+            self._stop()
+            self._checkpoint()
+        finally:
+            self._claim.release()
+
+    def _checkpoint(self) -> None:
+        """Fold the WAL once. Readers on this writer are already closed."""
+        if not self.path.is_file():
+            return
+        connection = connect(self.path, busy_ms=self._busy_ms)
+        try:
+            try:
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except apsw.BusyError:
+                return
+        finally:
+            connection.close()
+
+    def _stop(self) -> None:
         with self._life:
             while self._joining:
                 self._life.wait()
@@ -364,7 +510,16 @@ class LiteWriter:
         self.close()
 
     async def __aenter__(self) -> LiteWriter:
-        self.start()
+        took = False
+        if self._claim_timeout is not None and not self._claim.held():
+            await self.aclaim(self._claim_timeout)
+            took = self._claim.held()
+        try:
+            self.start()
+        except BaseException:
+            if took:
+                self._claim.release()
+            raise
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
@@ -381,7 +536,7 @@ class LiteWriter:
                 raise WriterRuntime("the writer is closed")
             if not self.path.exists():
                 raise _missing_file()
-            item = Reader(self)
+            item = Reader(self, self._busy_ms)
             with self._readers_lock:
                 self._readers.add(item)
         return item
@@ -476,7 +631,7 @@ class LiteWriter:
             return
         if busy:
             raise WriterRuntime("the writer is closed")
-        connection = connect(self.path)
+        connection = connect(self.path, busy_ms=self._busy_ms)
         try:
             connection.execute(sql)
         finally:
@@ -571,7 +726,7 @@ class LiteWriter:
                 raise _missing_file()
 
         def run() -> R:
-            connection = connect(self.path, readonly=True)
+            connection = connect(self.path, readonly=True, busy_ms=self._busy_ms)
             try:
                 return fn(connection, *args, **kwargs)
             finally:
@@ -589,7 +744,7 @@ class LiteWriter:
 
     def _run(self) -> None:
         try:
-            write = connect(self.path)
+            write = connect(self.path, busy_ms=self._busy_ms)
         except BaseException as exc:
             self._boot_error = exc
             self._ready.set()
@@ -931,12 +1086,14 @@ class Reader:
 
     __slots__ = ("_conn", "_db", "_lock", "_owner", "_retired")
 
-    def __init__(self, db: LiteWriter) -> None:
+    def __init__(self, db: LiteWriter, busy_ms: int) -> None:
         self._db = db
         self._owner = get_ident()
         self._lock = Lock()
         self._retired = False
-        self._conn: apsw.Connection | None = connect(db.path, readonly=True)
+        self._conn: apsw.Connection | None = connect(
+            db.path, readonly=True, busy_ms=busy_ms
+        )
 
     def execute(self, query: str | Clauses, params: Bindings = ()) -> apsw.Cursor:
         """Run SQL text or a query on this connection."""

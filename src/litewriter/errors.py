@@ -33,5 +33,9 @@ class WriterRuntime(WriterError):
     """Right call, wrong time (not started, already closed)."""
 
 
+class WriterBusy(WriterError):
+    """Another process holds the claim."""
+
+
 class WriterRolledBack(WriterError):
     """This write was undone because a non-isolated sibling failed the batch."""
