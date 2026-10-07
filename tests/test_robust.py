@@ -4,6 +4,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from threading import Thread
 
@@ -92,12 +93,29 @@ def test_acknowledged_writes_survive_a_killed_process(tmp_path: Path) -> None:
         if line.strip() == "ok":
             acknowledged += 1
     proc.wait(timeout=10)
-    conn = apsw.Connection(str(path))
-    try:
-        assert list(conn.execute("PRAGMA integrity_check")) == [("ok",)]
-    finally:
-        conn.close()
+    # A killed process can leave the WAL index locked on Windows.
+    # SQLite rebuilds that index from the WAL.
+    _integrity(path)
     assert _count(path) >= acknowledged
+
+
+def _integrity(path: Path) -> None:
+    shm = Path(f"{path}-shm")
+    last: BaseException | None = None
+    for _ in range(30):
+        shm.unlink(missing_ok=True)
+        try:
+            conn = apsw.Connection(str(path))
+            try:
+                assert list(conn.execute("PRAGMA integrity_check")) == [("ok",)]
+            finally:
+                conn.close()
+            return
+        except apsw.IOError as exc:
+            last = exc
+            time.sleep(0.05)
+    assert last is not None
+    raise last
 
 
 def test_many_threads_submit(tmp_path: Path) -> None:
