@@ -1,0 +1,15 @@
+src/litewriter/*.c
+src/litewriter/*.html
+src/litewriter/*.so
+src/litewriter/*.pyd
+*.egg-info/
+litewriter-*/
+.venv/
+build/
+dist/
+wheelhouse/
+.hypothesis/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]

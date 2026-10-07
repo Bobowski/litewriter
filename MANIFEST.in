@@ -1,0 +1,9 @@
+include LICENSE
+include README.md
+include CHANGELOG.md
+include src/litewriter/py.typed
+graft tests
+global-exclude *.so *.pyd *.html *.pyc
+prune tests/__pycache__
+prune src/*.egg-info
+recursive-exclude * *.egg-info

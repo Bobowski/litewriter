@@ -1,0 +1,89 @@
+[project]
+name = "litewriter"
+version = "0.1.0"
+description = "One SQLite writer thread and a query builder."
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Adam Bobowski", email = "adam.bobowski@wratilabs.com" }
+]
+keywords = ["sqlite", "apsw", "writer", "group-commit", "wal"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+dependencies = [
+    "apsw>=3.53.4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Bobowski/litewriter"
+Repository = "https://github.com/Bobowski/litewriter"
+Issues = "https://github.com/Bobowski/litewriter/issues"
+Changelog = "https://github.com/Bobowski/litewriter/blob/main/CHANGELOG.md"
+
+[build-system]
+requires = ["setuptools>=74.1"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+litewriter = ["py.typed"]
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.130",
+    "pyright>=1.1.403",
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.3.0",
+    "ruff>=0.12.8",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.pyright]
+pythonVersion = "3.14"
+typeCheckingMode = "basic"
+reportPrivateUsage = false
+reportMissingTypeStubs = false
+strict = ["src"]
+include = ["src", "tests"]
+exclude = ["**/.venv", "**/__pycache__", "benchmarks"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+src = ["src", "tests"]
+exclude = ["benchmarks", ".venv", "__pycache__"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "W", "I", "UP", "B", "SIM", "RUF", "PT"]
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.isort]
+known-first-party = ["litewriter", "tests"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
