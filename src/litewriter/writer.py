@@ -8,9 +8,10 @@ is the default. A failure undoes that write after the batch commits.
 A read uses this thread's own read-only connection. The writer does not
 need to be started. The file must exist.
 
-Waiters on an asyncio loop are woken once per batch via a socketpair
-mailbox — not once per job with ``call_soon_threadsafe``. Matching
-watches on that loop are set in that same wake.
+Waiters on an asyncio loop are woken once per batch. A socketpair
+mailbox does that when the loop supports ``add_reader``. Otherwise one
+``call_soon_threadsafe`` carries the batch. Matching watches on that
+loop are set in that same wake.
 
 A connection stays on the thread that opened it. The inbox, each
 result slot, the reader set, and the counters sit under a lock.
@@ -171,6 +172,15 @@ class _ThreadReads:
     def _drop(self, current: apsw.Connection) -> None:
         self._local.conn = None
         current.close()
+
+
+def _sleep_until(deadline: float) -> None:
+    """Sleep until ``deadline``. One ``sleep`` can return early."""
+    for _ in range(8):
+        leftover = deadline - time.monotonic()
+        if leftover <= 0:
+            return
+        time.sleep(leftover)
 
 
 def _bookkeeping(sql: str) -> bool:
@@ -603,14 +613,14 @@ class LiteWriter:
                 if self._profile:
                     self.stats.add(batches=1, jobs=len(batch))
                 period = 0.0 if self._hz == 0 else 1.0 / self._hz
-                leftover = period - (time.monotonic() - started)
-                if leftover > 0:
+                deadline = started + period
+                if period > 0 and deadline > time.monotonic():
                     if self._profile:
                         s0 = time.perf_counter_ns()
-                        time.sleep(leftover)
+                        _sleep_until(deadline)
                         self.stats.add(sleep_ns=time.perf_counter_ns() - s0)
                     else:
-                        time.sleep(leftover)
+                        _sleep_until(deadline)
                 if stop:
                     return
         finally:

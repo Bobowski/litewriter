@@ -1,6 +1,7 @@
 """Several processes, a killed writer, many threads, and large batches."""
 
 import asyncio
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -33,10 +34,21 @@ def add(tx: Tx, body: str) -> None:
     tx.execute("INSERT INTO t(body) VALUES (?)", (body,))
 
 
+def _child_env() -> dict[str, str]:
+    """A small environment. Windows still needs ``SystemRoot`` for Winsock."""
+    env = {"PYTHONPATH": SRC, "PATH": ""}
+    if sys.platform == "win32":
+        env["PATH"] = os.environ.get("PATH", "")
+        root = os.environ.get("SYSTEMROOT", "")
+        if root:
+            env["SYSTEMROOT"] = root
+    return env
+
+
 def _spawn(path: Path, tag: str, count: int) -> subprocess.Popen[str]:
     return subprocess.Popen(
         [sys.executable, "-c", WRITER, str(path), tag, str(count)],
-        env={"PYTHONPATH": SRC, "PATH": ""},
+        env=_child_env(),
         stdout=subprocess.PIPE,
         text=True,
     )

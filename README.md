@@ -373,11 +373,12 @@ uv run pytest
 `submit`, `call`, and `push` are safe from any OS thread. The writer
 owns the write connection. Each OS thread reads on its own connection.
 A `reader()` stays on the thread that opened it. Jobs sit on a deque
-and a Condition. After `COMMIT` the writer wakes each asyncio loop once
-per batch through a socketpair mailbox. Matching watches on that loop
-are set in that same wake. The mailbox is made on the loop's own thread
-(the first `call` or `watch` there), because `add_reader` is not
-thread-safe.
+and a Condition. After `COMMIT` the writer wakes each asyncio loop once per batch.
+A socketpair mailbox does that when the loop has `add_reader`.
+The Windows loop has no `add_reader`. One callback then carries the
+batch. Matching watches on that loop are set in that same wake.
+The mailbox is made on the loop's own thread (the first `call` or
+`watch` there), because `add_reader` is not thread-safe.
 
 Each connection has a 64 MiB page cache and maps up to 1 GiB of the file
 (`litewriter.connect.CACHE_KIB`, `MMAP_BYTES`).

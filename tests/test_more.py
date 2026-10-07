@@ -1,6 +1,9 @@
 import asyncio
+from asyncio import AbstractEventLoop
+from collections.abc import Callable
 from pathlib import Path
 from threading import Thread
+from typing import cast
 
 import apsw
 import pytest
@@ -200,3 +203,33 @@ async def test_after_commit_error_still_returns(tmp_path: Path) -> None:
     row_id = await db.call(insert, "ok")
     assert row_id > 0
     db.close()
+
+
+def test_a_loop_without_add_reader_wakes_once() -> None:
+    from litewriter.wake import LoopWake
+
+    ran: list[str] = []
+    queued: list[Callable[[], None]] = []
+
+    class Bare:
+        def add_reader(self, _fd: int, _callback: object) -> None:
+            raise NotImplementedError
+
+        def remove_reader(self, _fd: int) -> None:
+            raise AssertionError("no reader")
+
+        def is_closed(self) -> bool:
+            return False
+
+        def call_soon_threadsafe(self, fn: Callable[[], None]) -> None:
+            queued.append(fn)
+
+    wake = LoopWake(cast(AbstractEventLoop, Bare()))
+    wake.post(lambda: ran.append("a"))
+    wake.post(lambda: ran.append("b"))
+    assert len(queued) == 1
+    queued.pop()()
+    assert ran == ["a", "b"]
+    wake.close()
+    while queued:
+        queued.pop(0)()

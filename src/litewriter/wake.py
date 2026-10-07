@@ -1,7 +1,9 @@
 """Wake one asyncio loop once per batch. No per-job ``call_soon_threadsafe``.
 
-A mailbox is made on its loop's own thread (``ensure``), because
-``add_reader`` is not thread-safe. The writer only posts.
+A socketpair mailbox is made on its loop's own thread (``ensure``),
+because ``add_reader`` is not thread-safe. The writer only posts.
+A loop with no ``add_reader`` gets one ``call_soon_threadsafe`` for the
+batch. That is the Windows proactor loop.
 """
 
 import asyncio
@@ -17,36 +19,52 @@ type WakeFn = Callable[[], None]
 
 
 class LoopWake:
-    """Socketpair mailbox registered on one loop.
+    """One mailbox for one loop.
 
-    The writer posts work; the loop runs it. Many results, one ``recv``.
+    The writer posts work. The loop runs it. Many results, one wake.
+    A socketpair is that wake when the loop has ``add_reader``.
     """
 
     __slots__ = ("_lock", "_pending", "_rs", "_ws", "loop")
 
     def __init__(self, loop: AbstractEventLoop) -> None:
         self.loop = loop
+        self._lock = Lock()
+        self._pending: list[WakeFn] = []
+        self._rs: socket.socket | None = None
+        self._ws: socket.socket | None = None
         rs, ws = socket.socketpair()
         rs.setblocking(False)
         ws.setblocking(False)
+        try:
+            loop.add_reader(rs.fileno(), self._drain)
+        except NotImplementedError:
+            rs.close()
+            ws.close()
+            return
         self._rs = rs
         self._ws = ws
-        self._lock = Lock()
-        self._pending: list[WakeFn] = []
-        loop.add_reader(rs.fileno(), self._drain)
 
     def post(self, fn: WakeFn) -> None:
         with self._lock:
             first = not self._pending
             self._pending.append(fn)
-        if first:
-            with suppress(BlockingIOError, OSError):
-                self._ws.send(b"\0")
+        if not first:
+            return
+        ws = self._ws
+        if ws is None:
+            with suppress(RuntimeError):
+                self.loop.call_soon_threadsafe(self._drain)
+            return
+        with suppress(BlockingIOError, OSError):
+            ws.send(b"\0")
 
     def _drain(self) -> None:
-        with suppress(BlockingIOError, InterruptedError):
-            while self._rs.recv(256):
-                pass
+        rs = self._rs
+        if rs is not None:
+            with suppress(BlockingIOError, InterruptedError):
+                while rs.recv(256):
+                    pass
         with self._lock:
             work = self._pending
             self._pending = []
@@ -74,11 +92,17 @@ class LoopWake:
         self._shut()
 
     def _shut(self) -> None:
-        with suppress(ValueError, OSError):
-            if not self.loop.is_closed():
-                self.loop.remove_reader(self._rs.fileno())
-        self._rs.close()
-        self._ws.close()
+        rs = self._rs
+        ws = self._ws
+        self._rs = None
+        self._ws = None
+        if rs is not None:
+            with suppress(ValueError, OSError):
+                if not self.loop.is_closed():
+                    self.loop.remove_reader(rs.fileno())
+            rs.close()
+        if ws is not None:
+            ws.close()
 
 
 class LoopWakes:
