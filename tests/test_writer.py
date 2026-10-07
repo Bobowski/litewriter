@@ -328,10 +328,13 @@ def test_hz_caps_commit_rate(tmp_path: Path) -> None:
     writer = LiteWriter(tmp_path / "hz.sqlite3", hz=50, after_commit=after)
     writer.execute_script(SCHEMA)
     writer.start()
+    # The first commit opens the file. Later commits show the floor.
+    writer.submit(insert, "warm").result(timeout=2.0)
+    ticks.clear()
     for i in range(4):
         writer.submit(insert, str(i)).result(timeout=2.0)
     writer.close()
     assert len(ticks) == 4
     gaps = [b - a for a, b in pairwise(ticks)]
-    # 50 Hz → 20 ms floor between commits; allow jitter.
+    # 50 Hz leaves about 20 ms from the start of one commit to the next.
     assert min(gaps) >= 0.012
