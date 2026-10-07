@@ -514,7 +514,8 @@ def _const(value: int) -> _Built:
     def ev(_n: int) -> int:
         return value
 
-    return value, ev
+    # An Expr keeps ``-`` and ``*`` on the builder. A bare int would repeat a tuple.
+    return Expr(value), ev
 
 
 def _column() -> _Built:
@@ -578,6 +579,10 @@ def _memory() -> apsw.Connection:
     return conn
 
 
+@example(_apply("=", _const(0), _unary("neg", _const(0))), 0)
+@example(_apply("*", _const(2), _unary("neg", _const(0))), 0)
+@example(_apply("*", _const(0), _unary("neg", _const(0))), 0)
+@example(_apply("+", _const(1), _unary("neg", _const(2))), 3)
 @given(built=_expr_trees(), n=st.integers(-6, 6))
 @_FAST
 def test_an_expression_matches_sqlite(built: _Built, n: int) -> None:
