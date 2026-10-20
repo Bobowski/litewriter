@@ -581,6 +581,18 @@ async def test_identical_watches_share_the_reread(db: LiteWriter) -> None:
         Watch._read = original  # type: ignore[method-assign]
 
 
+async def test_an_attach_in_a_write_keeps_watches_working(db: LiteWriter) -> None:
+    def attach(tx: Tx) -> None:
+        tx.execute("ATTACH ':memory:' AS scratch")
+
+    async with db.watch(PAGE) as live:
+        it = aiter(live)
+        assert await anext(it) == []
+        await db.write(attach)
+        await db.write(insert, "x")
+        assert await asyncio.wait_for(anext(it), 2) == [(1, "x")]
+
+
 async def test_a_watch_on_a_missing_table_is_a_query_error(db: LiteWriter) -> None:
     with pytest.raises(QueryError, match="prepare"):
         async with db.watch("SELECT * FROM nope"):
