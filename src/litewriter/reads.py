@@ -11,11 +11,10 @@ next read.
 
 import asyncio
 import weakref
-from asyncio import AbstractEventLoop
 from contextlib import suppress
 from pathlib import Path
 from threading import Lock, local
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import apsw
 
@@ -99,7 +98,7 @@ class ThreadReads:
         st = self._state(path)
         if not st.snap:
             return st.conn
-        loop = cast("AbstractEventLoop | None", asyncio._get_running_loop())
+        loop = asyncio._get_running_loop()
         if loop is None:
             return st.conn
         if st.snap_task is not None and (asyncio.current_task() is not st.snap_task):
@@ -153,7 +152,7 @@ class ThreadReads:
         conn.execute("BEGIN")
         conn.execute("PRAGMA schema_version").fetchall()
         st.txn = True
-        loop = cast("AbstractEventLoop | None", asyncio._get_running_loop())
+        loop = asyncio._get_running_loop()
         st.snap_task = asyncio.current_task() if loop is not None else None
         st.snap_broken = False
         if loop is not None:
