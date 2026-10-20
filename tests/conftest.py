@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from litewriter import LiteWriter
+from litewriter import LiteWriter, Tx
 
 SCHEMA = """
 CREATE TABLE t(
@@ -14,6 +14,15 @@ CREATE TABLE t(
     body TEXT NOT NULL
 ) STRICT
 """
+
+
+def insert(tx: Tx, body: str) -> int:
+    tx.execute("INSERT INTO t(body) VALUES (:body)", body=body)
+    return tx.last_insert_rowid()
+
+
+def boom(_tx: Tx, message: str) -> None:
+    raise ValueError(message)
 
 
 @asynccontextmanager
@@ -41,8 +50,7 @@ async def one_batch(db: LiteWriter):
 
 @pytest.fixture
 def db(tmp_path: Path) -> Iterator[LiteWriter]:
-    writer = LiteWriter(tmp_path / "t.sqlite3", hz=0, name="test")
+    writer = LiteWriter(tmp_path / "t.sqlite3", hz=0, schema=SCHEMA)
     writer.start()
-    writer.execute_script(SCHEMA)
     yield writer
     writer.close()

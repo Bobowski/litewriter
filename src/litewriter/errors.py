@@ -1,5 +1,27 @@
-class WriterError(Exception):
-    """Wrong arguments or a bad call. ``str(exc)`` includes help."""
+"""The error types. ``str(exc)`` carries context, help, and an example."""
+
+import math
+
+
+def check_seconds(
+    value: object, what: str, example: str, help_text: str | None = None
+) -> float:
+    """``value`` as a count of seconds, or a QueryError."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise QueryError(f"{what} must be a number of seconds", example=example)
+    try:
+        seconds = float(value)
+    except OverflowError:
+        seconds = math.inf
+    if not math.isfinite(seconds) or seconds < 0:
+        raise QueryError(
+            f"{what} must be 0 or greater", help_text=help_text, example=example
+        )
+    return seconds
+
+
+class LiteError(Exception):
+    """Base of every litewriter error. ``str(exc)`` includes help."""
 
     __slots__ = ("context", "example", "help_text", "message")
 
@@ -29,13 +51,13 @@ class WriterError(Exception):
         return "\n".join(parts)
 
 
-class WriterRuntime(WriterError):
-    """Right call, wrong time (not started, already closed)."""
+class QueryError(LiteError, ValueError):
+    """Bad arguments or a bad query: unknown name, missing param, no row."""
 
 
-class WriterBusy(WriterError):
+class StateError(LiteError, RuntimeError):
+    """Right call, wrong time: not started, closed, or a blocked loop."""
+
+
+class ClaimBusy(LiteError):
     """Another process holds the claim."""
-
-
-class WriterRolledBack(WriterError):
-    """This write was undone because a non-isolated sibling failed the batch."""

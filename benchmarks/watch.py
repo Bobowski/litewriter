@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from litewriter.writer import LiteWriter
+from litewriter import LiteWriter, Tx
 from litewriter.watch import Watch
 
 N = 2_000
@@ -33,22 +33,21 @@ NAME = "SELECT name FROM users WHERE id = 1"
 SEEN = "SELECT seen FROM users WHERE id = 1"
 
 
-def insert_mail(tx, body: str) -> None:
-    tx.execute("INSERT INTO mail(body) VALUES (?)", (body,))
+def insert_mail(tx: Tx, body: str) -> None:
+    tx.execute("INSERT INTO mail(body) VALUES (:body)", body=body)
 
 
-def touch_seen(tx, seen: int) -> None:
-    tx.execute("UPDATE users SET seen = ? WHERE id = 1", (seen,))
+def touch_seen(tx: Tx, seen: int) -> None:
+    tx.execute("UPDATE users SET seen = :seen WHERE id = 1", seen=seen)
 
 
-def touch_name(tx, name: str) -> None:
-    tx.execute("UPDATE users SET name = ? WHERE id = 1", (name,))
+def touch_name(tx: Tx, name: str) -> None:
+    tx.execute("UPDATE users SET name = :name WHERE id = 1", name=name)
 
 
 def open_db(path: Path) -> LiteWriter:
-    db = LiteWriter(path, hz=0)
+    db = LiteWriter(path, hz=0, schema=SCHEMA)
     db.start()
-    db.execute_script(SCHEMA)
     return db
 
 
@@ -59,7 +58,7 @@ def us(elapsed: float, n: int) -> str:
 async def writes(db: LiteWriter, fn, n: int) -> float:
     t0 = time.perf_counter()
     for i in range(n):
-        await db.call(fn, i)
+        await db.write(fn, i)
     return time.perf_counter() - t0
 
 
@@ -77,7 +76,7 @@ async def once(path: Path, sample) -> tuple[float, int]:
         try:
             elapsed = await sample(db, reads)
         finally:
-            db.close()
+            await db.aclose()
     finally:
         Watch._read = original  # type: ignore[method-assign]
     return elapsed, reads["n"]
@@ -136,7 +135,7 @@ async def bench() -> None:
                 reads["n"] = 0
                 t0 = time.perf_counter()
                 for i in range(N):
-                    await db.call(touch_name, f"Ada {i}")
+                    await db.write(touch_name, f"Ada {i}")
                     await anext(it)
                 return time.perf_counter() - t0
 
@@ -148,7 +147,7 @@ async def bench() -> None:
                 t0 = time.perf_counter()
                 for i in range(N):
                     db.push(touch_name, f"Ada {i}")
-                await db.call(touch_name, "Ada end")
+                await db.write(touch_name, "Ada end")
                 elapsed = time.perf_counter() - t0
                 await anext(it)
                 return elapsed

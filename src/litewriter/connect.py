@@ -1,10 +1,13 @@
-from collections.abc import Mapping, Sequence
+"""Open a SQLite file with the pragmas litewriter wants.
+
+The write connection is a plain path. The read connection is a URI —
+``Path.as_uri`` quotes spaces, ``#``, ``?``, and ``%`` so a file named
+``a%20b.sqlite3`` reads its own bytes, not ``a b.sqlite3``.
+"""
+
 from pathlib import Path
 
 import apsw
-
-# A sequence is positional. A mapping fills :name.
-type Bindings = Sequence[object] | Mapping[str, object]
 
 CACHE_KIB = 64 * 1024
 """Page cache per connection (KiB)."""
@@ -21,15 +24,13 @@ def connect(
     ``busy_ms`` is the SQLite busy timeout in milliseconds.
     The write connection must be created on the writer thread.
     """
-    raw = str(path)
     if readonly:
-        uri = raw if raw.startswith("file:") else f"file:{raw}"
-        uri = f"{uri}&mode=ro" if "?" in uri else f"{uri}?mode=ro"
+        uri = Path(path).absolute().as_uri() + "?mode=ro"
         connection = apsw.Connection(
             uri, flags=apsw.SQLITE_OPEN_URI | apsw.SQLITE_OPEN_READONLY
         )
     else:
-        connection = apsw.Connection(raw)
+        connection = apsw.Connection(str(path))
     _pragmas(connection, busy_ms)
     return connection
 

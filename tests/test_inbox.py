@@ -1,24 +1,11 @@
+import asyncio
+from concurrent.futures import Future
 from threading import Thread
 
 import pytest
 
-from litewriter.errors import WriterRuntime
-from litewriter.inbox import Inbox, Slot
-
-
-def test_put_get_order() -> None:
-    box: Inbox[int] = Inbox()
-    box.put(1)
-    box.put(2)
-    assert box.get() == 1
-    assert box.take_rest() == [2]
-
-
-def test_take_rest_empty() -> None:
-    box: Inbox[int] = Inbox()
-    box.put(1)
-    assert box.get() == 1
-    assert box.take_rest() == []
+from litewriter.errors import StateError
+from litewriter.inbox import Inbox, Job, settle
 
 
 def test_many_producers() -> None:
@@ -34,11 +21,7 @@ def test_many_producers() -> None:
         thread.start()
     for thread in threads:
         thread.join()
-    seen: list[int] = []
-    first = box.get()
-    seen.append(first)
-    seen.extend(box.take_rest())
-    assert sorted(seen) == list(range(4 * n))
+    assert sorted(box.take_batch()) == list(range(4 * n))
 
 
 def test_take_batch_waits_then_drains() -> None:
@@ -51,36 +34,57 @@ def test_take_batch_waits_then_drains() -> None:
     assert box.take_batch() == [4]
 
 
-def test_slot_result_from_another_thread() -> None:
-    slot: Slot[int] = Slot()
+def test_job_runs_the_callable() -> None:
+    job = Job(lambda tx, a, b, *, y: (tx, a, b, y), (1, 2), {"y": 3}, None, None)
+    assert job.run("t") == ("t", 1, 2, 3)
+    bare = Job(lambda tx: "ok", (), {}, None, None)
+    assert bare.run("t") == "ok"
+
+
+def test_future_result_from_another_thread() -> None:
+    future: Future[int] = Future()
 
     def wait() -> None:
-        assert slot.result(timeout=2) == 5
+        assert future.result(timeout=2) == 5
 
     thread = Thread(target=wait)
     thread.start()
-    slot.set_result(5)
+    settle(future, 5, None)
     thread.join(timeout=2)
     assert not thread.is_alive()
-    assert slot.done()
+    assert future.done()
 
 
-def test_slot_result_and_error() -> None:
-    ok: Slot[int] = Slot()
-    ok.set_result(7)
+def test_settle_result_and_error() -> None:
+    ok: Future[int] = Future()
+    settle(ok, 7, None)
     assert ok.done()
     assert ok.result() == 7
-    bad: Slot[int] = Slot()
-    bad.set_exception(ValueError("nope"))
+    bad: Future[int] = Future()
+    settle(bad, None, ValueError("nope"))
     with pytest.raises(ValueError, match="nope"):
         bad.result()
+
+
+def test_settle_skips_a_cancelled_waiter() -> None:
+    future: Future[int] = Future()
+    future.cancel()
+    settle(future, 1, None)
+    assert future.cancelled()
+
+
+async def test_settle_an_async_future() -> None:
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[int] = loop.create_future()
+    settle(future, 9, None)
+    assert await future == 9
 
 
 def test_closed_inbox_refuses_and_returns_the_rest() -> None:
     box: Inbox[int] = Inbox()
     box.put(1)
     assert box.close() == [1]
-    with pytest.raises(WriterRuntime, match="closed"):
+    with pytest.raises(StateError, match="closed"):
         box.put(2)
     box.reopen()
     box.put(3)

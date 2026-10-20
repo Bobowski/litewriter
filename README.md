@@ -1,432 +1,268 @@
-# Litewriter
+# litewriter
+
+SQLite for asyncio apps: one writer thread, group commit, live queries.
 
 ```text
-pip install litewriter
+pip install litewriter    # CPython 3.14+, depends on APSW
 ```
 
-Source: https://github.com/Bobowski/litewriter
+## The idea
 
-The index name is `litewriter`. The import is `litewriter`.
-The class is `LiteWriter`. It is SQLite only.
+SQLite allows one writer at a time. litewriter builds on that rule instead of fighting it:
 
-One SQLite file. One writer thread. Writes that are waiting share one
-`COMMIT`. Each OS thread reads on its own connection. A read does not
-wait on that writer. A watch reads again when a commit changes a column
-it reads.
+- **One writer thread** owns the write connection. Every write goes through it.
+- **Group commit.** Writes that arrive together share one transaction and one `COMMIT`.
+- **Reads never queue.** Each thread reads on its own read-only connection (WAL mode).
+- **Live queries.** `db.watch(q)` reads `q` again only when a commit touched a column that `q` reads.
 
-```python
-from litewriter import LiteWriter
-```
-
-## A query
-
-A query is a statement. The constructor takes the clauses.
-`col` is a name. `lit` is a string literal. `param` is a parameter.
-`sql(q)` returns one line of SQL. `query` returns a list of tuples.
-
-```python
-from litewriter import Select, col, param, sql
-
-page = Select(
-    col("m.id"),
-    col("m.body"),
-    ("as", ("lower", "u.name"), "author"),
-    from_=col("messages").as_("m"),
-    join=("left", col("users").as_("u"), col("m.author") == col("u.id")),
-    where=col("m.room") == param("room"),
-    order_by=col("m.at").desc(),
-    limit=50,
-)
-print(sql(page))
-
-mine = page.where(col("m.author") == param("me")).limit(20)
-print(sql(mine))
-print(sql(page))
-
-listed = Select(
-    "id",
-    from_="t",
-    where=[col("room") == param("room"), col("at") > 0],
-)
-print(sql(listed))
-
-inner = Select("id", from_="t", where=col("ok") == 1)
-print(sql(Select(col("s.id"), from_=inner.as_("s"))))
-```
-
-```text
-SELECT m.id, m.body, lower(u.name) AS author FROM messages AS m LEFT JOIN users AS u ON m.author = u.id WHERE m.room = :room ORDER BY m.at DESC LIMIT 50
-SELECT m.id, m.body, lower(u.name) AS author FROM messages AS m LEFT JOIN users AS u ON m.author = u.id WHERE m.room = :room AND m.author = :me ORDER BY m.at DESC LIMIT 20
-SELECT m.id, m.body, lower(u.name) AS author FROM messages AS m LEFT JOIN users AS u ON m.author = u.id WHERE m.room = :room ORDER BY m.at DESC LIMIT 50
-SELECT id FROM t WHERE room = :room AND at > 0
-SELECT s.id FROM (SELECT id FROM t WHERE ok = 1) AS s
-```
-
-The third line is the first line again. `page.where(...)` returns a new
-statement. `page` stays as it was. `.where(a, b)` joins those arguments
-with `AND`. A list is one argument. `.where([a, b])` does not compile.
-
-In a constructor, a list of conditions is `AND`. A list that starts with
-a name is a call. `["=", "room", ":room"]` is `room = :room`.
-`("count", "*")` is `count(*)`. The string `count(*)` is not a name.
-
-`&` and `|` are bitwise. An expression has no truth value. The words
-`and` and `or` raise `TypeError`. Put conditions in a list in the
-constructor. That list is `AND`.
-
-`from_` and `with_` keep the underscore. `from` and `with` are Python
-keywords.
-
-A `Select` is a subquery. `from_=inner.as_("s")` is
-`FROM (SELECT ...) AS s`. The same form works in a join, in `where`,
-and in the select list.
-
-A tuple is a call. `("lower", "name")` is `lower(name)`.
-`("as", expr, "name")` is the same alias as `.as_("name")`.
-`("lit", "open")` is the same literal as `lit("open")`.
-
-`Select` has the select methods. `Insert` has the insert methods.
-`Update` has `set`, `from_`, and `where`. `Delete` has `where`.
-A union has `order_by` and `limit`. The constructor is the whole
-statement. A method adds one clause. A dict of clauses still renders.
-
-## Values
-
-A value becomes SQL:
-
-| Value | SQL |
-| --- | --- |
-| `col("u.name")`, `col("*")`, `col("u.*")` | a name (a keyword such as `order` is quoted) |
-| `lit("open")` or `"'open'"` or `("lit", "open")` | a string literal |
-| `param("room")` or `":room"` | a parameter |
-| `col("room") == param("room")` | `room = :room` |
-| `Select("id", from_="t").as_("s")` | `(SELECT id FROM t) AS s` |
-| `1`, `2.5`, `True`, `None`, `b"\x01"` | `1`, `2.5`, `TRUE`, `NULL`, `X'01'` |
-| `("lower", "u.name")` or `["lower", "u.name"]` | a call: `lower(u.name)` |
-| `("as", "messages", "m")` | `messages AS m` |
-| `("as", ("lower", "u.name"), "author")` | `lower(u.name) AS author` |
-| `{"select": ["id"], "from": "t"}` | `(SELECT id FROM t)` |
-
-`None` in a value list is `NULL`. `col("deleted_at") == None` raises
-`WriterError`. `= NULL` never matches. `col("deleted_at").is_(None)` is
-`deleted_at IS NULL`. A string literal has no NUL.
-
-A call name that is not an operator is a function. LiteWriter does not
-keep a list of functions. `json_extract`, `datetime`, and a function
-that you register on the connection all work the same way.
-
-A value from outside goes in as a parameter (`:name`), never as text.
-
-## Calls
-
-The call name is not case sensitive.
-
-| Call | SQL |
-| --- | --- |
-| `["=", a, b]`, also `!=` `<` `<=` `>` `>=` `is` `is not` `like` `glob` `regexp` `match` | `a = b` |
-| `["and", a, b, c]`, `["or", ...]` | `a AND b AND c` |
-| `["+", a, b]`, also `-` `*` `/` `%` `\|\|` `->` `->>` `&` `\|` `<<` `>>` | `a + b` |
-| `["not", a]` | `NOT a` |
-| `["in", a, x, y]`, `["in", a, query]`, `not in` | `a IN (x, y)` |
-| `["between", a, lo, hi]`, `not between` | `a BETWEEN lo AND hi` |
-| `["exists", query]`, `not exists` | `EXISTS (...)` |
-| `["case", when, then, ..., else]` | `CASE WHEN ... END` |
-| `["as", a, "name"]` | `a AS name` |
-| `["cast", a, "integer"]` | `CAST(a AS INTEGER)` |
-| `["collate", a, "nocase"]` | `a COLLATE NOCASE` |
-| `["desc", a]`, `["asc", a, "nulls last"]` | `a DESC` |
-| `["distinct", a]` | `DISTINCT a` |
-| `["raw", "any SQL"]` | the text as it is |
-
-Parentheses come out only where SQL needs them.
-`["and", ["or", a, b], c]` is `(a OR b) AND c`.
-
-## Clauses
-
-The key order in the dict does not matter. The output uses SQL order.
-
-| Statement | Keys |
-| --- | --- |
-| select | `with`, `with_recursive`, `select` or `select_distinct`, `from`, `join`, `where`, `group_by`, `having`, `order_by`, `limit`, `offset` |
-| compound | `union`, `union_all`, `intersect`, or `except` (a list of queries), `order_by`, `limit`, `offset` |
-| insert | `insert_into`, `columns`, `values` or the select keys, `on_conflict`, `do_nothing`, `do_update_set`, `returning` |
-| update | `update`, `set`, `from`, `join`, `where`, `returning` |
-| delete | `delete_from`, `where`, `returning` |
-
-- `select`, `group_by`, `order_by`, `returning`, and `columns` are lists.
-  A call sits in its own list: `"select": [["count", "*"]]`.
-- `from` is a table, `("as", "table", "t")`, a table function
-  (`("json_each", ":ids")`), or a subquery.
-- `join` is `(kind, source, on)`. A list of those is many joins.
-  `kind` is `inner`, `left`, `right`, `full`, or `cross`.
-  A cross join is `("cross", source)`.
-- `with` is a dict of name to query.
-- `values` is one row (a dict) or many rows. A list of lists needs
-  `columns`.
-- `set` and `do_update_set` are a dict of column to value.
-- `on_conflict` is a list of columns. `[]` means any conflict.
-  `do_update` needs those column names.
-
-An unknown key raises `WriterError`. A key that does not belong on that
-statement raises `WriterError`. A bad name or a missing parameter does
-too. An insert may contain the select keys. That form is
-`INSERT INTO t SELECT ...`.
-
-## The file
-
-This program replaces `example.sqlite3` in the current directory.
-`async with` starts the writer and closes it at the end. `hz=0` commits
-as soon as the job arrives. The default is 60.
+## Quick start
 
 ```python
 import asyncio
+import tempfile
 from pathlib import Path
 
-from litewriter import Insert, LiteWriter, Select, Tx, col, param
-
-page = Select(
-    col("m.id"),
-    col("m.body"),
-    ("as", ("lower", "u.name"), "author"),
-    from_=col("messages").as_("m"),
-    join=("left", col("users").as_("u"), col("m.author") == col("u.id")),
-    where=col("m.room") == param("room"),
-    order_by=col("m.at").desc(),
-    limit=50,
-)
-mine = page.where(col("m.author") == param("me")).limit(20)
+from litewriter import LiteWriter, Tx
 
 SCHEMA = """
-CREATE TABLE users (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL
-);
-CREATE TABLE messages (
+CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY,
     room INTEGER NOT NULL,
-    author INTEGER REFERENCES users (id),
-    body TEXT NOT NULL,
-    at INTEGER NOT NULL
+    body TEXT NOT NULL
 );
 """
+ROOM = "SELECT body FROM messages WHERE room = :room ORDER BY id"
 
 
-def add_user(tx: Tx, name: str) -> int:
+def send(tx: Tx, room: int, body: str) -> int:
     return tx.value(
-        Insert("users", values={"name": ":name"}, returning="id"),
-        name=name,
-    )
-
-
-def send(tx: Tx, room: int, body: str, author: int, at: int) -> int:
-    return tx.value(
-        Insert(
-            "messages",
-            values={
-                "room": ":room",
-                "author": ":author",
-                "body": ":body",
-                "at": ":at",
-            },
-            returning="id",
-        ),
+        "INSERT INTO messages (room, body) VALUES (:room, :body) RETURNING id",
         room=room,
-        author=author,
         body=body,
-        at=at,
     )
 
 
 async def main() -> None:
-    path = Path("example.sqlite3")
-    path.unlink(missing_ok=True)
-    path.with_name(path.name + "-wal").unlink(missing_ok=True)
-    path.with_name(path.name + "-shm").unlink(missing_ok=True)
-    async with LiteWriter(path, hz=0) as db:
-        db.execute_script(SCHEMA)
-        user = await db.call(add_user, "Ada")
-        msg = await db.call(send, 8, "hi", user, 1)
-        print("msg", msg)
-        print("page", db.query(page, room=8))
-        print("mine", db.query(mine, room=8, me=user))
-        print("empty", db.one(page, room=9))
-        print("count", db.value(Select(("count", "*"), from_="messages")))
-        row = db.execute(
-            "SELECT name FROM users WHERE id = :id",
-            {"id": user},
-        ).fetchone()
-        print("name", tuple(row))
-        print("tables", sorted(db.tables(page)))
-        with db.reader() as reader:
-            print("reader", reader.query(page, room=8))
-        async with db.watch(page, room=8) as live:
-            found = aiter(live)
-            print("now", await anext(found))
-            await db.call(send, 8, "next", user, 2)
-            print("later", await anext(found))
+    path = Path(tempfile.mkdtemp()) / "chat.sqlite3"
+    async with LiteWriter(path, schema=SCHEMA) as db:
+        print(await db.write(send, 1, "hi"))
+
+        async with db.watch(ROOM, room=1) as live:
+            async for rows in live:
+                print(rows)
+                if len(rows) >= 3:
+                    break
+                db.push(send, 1, f"msg {len(rows) + 1}")
 
 
 asyncio.run(main())
 ```
 
 ```text
-msg 1
-page [(1, 'hi', 'ada')]
-mine [(1, 'hi', 'ada')]
-empty None
-count 1
-name ('Ada',)
-tables ['messages', 'users']
-reader [(1, 'hi', 'ada')]
-now [(1, 'hi', 'ada')]
-later [(2, 'next', 'ada'), (1, 'hi', 'ada')]
+1
+[('hi',)]
+[('hi',), ('msg 2',)]
+[('hi',), ('msg 2',), ('msg 3',)]
 ```
 
-The writer calls `fn(tx, *args, **kwargs)` on the writer thread, inside
-`BEGIN IMMEDIATE`. You do not `COMMIT`. You do not keep `tx`. You do not
-block. `tx.value` is the first column of the first row. `tx.one` is the
-first row. `tx.query` is every row. `tx.execute` runs SQL you already
-have. A sequence fills `?`. A mapping fills `:name`.
+## Writes are functions
 
-- `await db.call(fn, ...)` waits on this asyncio loop. The caller thread stays free.
-- `db.push(fn, ...)` puts the write on the queue. It does not wait. Errors go to `on_error`.
-- `db.submit(fn, ...)` returns a slot. `.result()` waits on the caller thread.
-  On an asyncio loop, use `call`.
-- The result comes after the batch `COMMIT`.
-- `hz=60` is the default. After a commit, the writer sleeps the rest of that 1/60 s.
-  When the inbox is empty, the writer parks. `hz=0` commits as fast as
-  jobs arrive. You can change `db.hz` while it runs.
-- `busy_timeout=5` is the default. The number is seconds. SQLite waits
-  that long when another connection holds a lock. `0` returns at once.
-  A negative number raises `WriterError`. A number SQLite cannot store
-  raises `WriterError`.
-- `isolated=True` is the default. It sets a SAVEPOINT for that write.
-  A failure undoes only that write. The error comes back after the rest
-  of the batch commits. `isolated(fn)` does the same thing.
-- `isolated=False` shares the batch. A failure rolls back the whole batch.
-  The other writes in that batch get `WriterRolledBack`.
-- `db.close()` drains the inbox, commits the last batch, folds the WAL,
-  and stops. A write that arrives too late fails with `WriterRuntime`.
-- `submit` returns `Slot[R]`, and `call` returns `R`, where `R` is the
-  return type of `fn`. Pyright checks the arguments against `fn`.
-
-## Claim
-
-`claim` is how one process takes the file during a switch. The lock
-is a sibling file, `{path}-claim`. SQLite's own locks stay as they are.
-Readers keep working. A process that never claims can still write.
-SQLite still serializes those commits.
-
-`claim=None` is the default. `start` does not claim. `async with`
-does not claim. Several processes can write one file.
-
-Pass `claim=30` when this process must own the file. `start` and
-`async with` then claim, then start the writer. The number is the
-timeout in seconds. `close` folds the WAL, then drops the claim.
-The kernel also drops it when the process dies.
+A write is a plain function. Its first argument is `tx`:
 
 ```python
-async with LiteWriter(path, claim=30) as db:
-    db.execute_script(SCHEMA)
-    yield
+def rename(tx: Tx, user_id: int, name: str) -> None:
+    tx.execute("UPDATE users SET name = :name WHERE id = :id", name=name, id=user_id)
 ```
 
-That block is claim, start, serve, close. The schema runs after the
-writer starts. To run it before the writer thread, claim first:
+The writer calls it on the writer thread, inside `BEGIN IMMEDIATE`. `tx.execute` returns nothing: run `tx.value("SELECT changes()")` for a changed-row count. You never commit. Do not run `BEGIN`, `COMMIT`, `END`, or `ROLLBACK` inside a write: the batch fails with `StateError`. Keep the function short: no network, no sleep, no hashing. It holds the whole batch.
 
-```python
-db = LiteWriter(path)
-await db.aclaim(timeout=30)
-db.execute_script(SCHEMA)
-db.start()
-```
+There are three ways to send a write:
 
-`db.claim(timeout=30)` is the same wait on the calling thread.
-`await db.aclaim(timeout=30)` runs the wait off the loop. With
-`claim=None`, pass `timeout=` yourself. A second `claim()` does
-nothing while this writer holds the lock. `timeout=0` tries once.
+| Call | Waits | You get | Use it from |
+| --- | --- | --- | --- |
+| `await db.write(fn, *args)` | on the event loop | the return value, or the exception | async code |
+| `db.submit(fn, *args)` | no | a Future; `.result()` blocks this thread | threads, scripts, tests |
+| `db.push(fn, *args)` | no | nothing; errors go to `on_error` | logs, counters, fire and forget |
 
-The call raises `WriterBusy` when the wait ends. The context names
-the holder pid when the lock file has one. The process should abort
-before it serves. `close` during the wait ends it with `WriterRuntime`.
+A result arrives after the batch commits. A returned value is on disk.
+
+On an event loop, use `await db.write`. A `.result()` there would block every request until the commit, so it raises `StateError` instead.
+
+An `async def` write function raises `QueryError`: the writer thread cannot await it. `submit().result()` inside a write raises `StateError`: the writer would wait on itself — call the other write function directly with the same `tx`. `close()` inside a write raises `StateError` for the same reason.
+
+On an event loop, `close()` raises `StateError`: it would block the loop while it drains. Leave through `async with`, or call `await db.aclose()` — both close on a worker thread, and a cancelled `aclose` still finishes the drain on a daemon thread.
+
+**Failure.** Each write runs in its own savepoint. When the function raises, only that write is undone. The rest of the batch commits. The exception goes back to that caller.
+
+**Cancel.** A write cancelled before the writer starts it does not run. A write cancelled after that still commits.
+
+**Pacing.** With `hz=60` (the default) the writer waits out the rest of 1/60 s after each commit, so the next batch is larger. A write waits at most one period. An idle writer sleeps and does not spin. `hz=0` commits as soon as work arrives. Awaited in sequence, each write waits one period: 30 `await db.write` calls at `hz=60` take about half a second. Put related changes in one write function, or `asyncio.gather` them.
 
 ## Reads
 
-| Call | Returns |
-| --- | --- |
-| `db.reader()` | a new read-only connection. Open as many as you need |
-| `db.query(q, **params)` | all rows, a list of tuples |
-| `db.one(q, **params)` | the first row, or None |
-| `db.value(q, **params)` | the first column of the first row. No row raises `WriterError` |
-| `db.execute(q, params)` | an APSW cursor. `params` is a mapping or a sequence |
-| `db.watch(q, **params)` | live rows. The writer must be started |
-| `db.tables(q)` | the tables `q` reads |
-| `db.offload(fn)` | `fn(conn)` on a worker thread, for a rare large read |
+```python
+db.query(q, **params)   # every row, a list of tuples
+db.one(q, **params)     # the first row, or None
+db.value(q, **params)   # the first column of the first row; no row raises
+```
 
-`q` is SQL text or a query. A dict of clauses is still a query.
-`query`, `one`, and `value` take keyword arguments.
-`execute` takes the bindings as one argument.
+`q` is SQL text or a builder statement. `:name` in the SQL takes the keyword argument `name`. On a builder statement the names `_1`, `_2`, … are reserved for the values the builder binds; plain SQL text may use `:_1`. A read runs on the calling thread. On an event loop a read holds the loop for its duration, so keep reads short and indexed. Move a big report to `asyncio.to_thread`. A read does not need the writer to be started, but the file must exist.
 
-A read does not enter the writer queue. The writer does not need to be
-started. The file must exist. A missing file raises `WriterRuntime`.
-`db.query` uses one read-only connection for this OS thread. Another
-thread opens its own connection. `db.reader()` opens one more.
-Use that reader from the thread that opened it. Close it on that thread.
-`db.close()` closes a reader opened on this thread. A reader on another
-thread closes on its next use.
+Inside a write, reads go through `tx`: `tx.query`, `tx.one`, and `tx.value` see the uncommitted batch. The `db` read calls and `db.snapshot()` raise `StateError` there — `db` reads committed data, so inside a write they would see the world before the batch began.
+
+A second positional argument builds each row. A dataclass or a named tuple fits:
+
+```python
+@dataclass(frozen=True)
+class Message:
+    id: int
+    body: str
+
+rows = db.query("SELECT id, body FROM messages WHERE room = :room", Message, room=1)
+```
+
+### `db.snapshot()`
+
+`with db.snapshot():` gives the block's reads on this thread one fixed view: they see the data as of entry, even when the writer commits in between. Nested blocks join the outer view.
+
+```python
+with db.snapshot():
+    head = db.one("SELECT ...")
+    rows = db.query("SELECT ...")   # head and rows agree
+```
+
+On an event loop the block cannot contain an `await`: the view ends, the block raises `StateError`, and other tasks keep reading fresh data. On a plain thread there is no such limit, but keep the block short — an open snapshot holds back the WAL checkpoint. After `close()`, entering raises `StateError` like a read does.
 
 ## Watch
 
-The first read is the rows now. A later read comes after a commit that
-changed them. `async for rows in live` keeps going. The program above
-stops after the second read. A slow reader gets the newest rows, not a
-queue of old ones.
-
-The commit does not run the query. SQLite names the columns the query
-reads, once, when the watch opens. The writer records inserts, deletes,
-and updated columns only while a watch is open. `BEGIN`, `COMMIT`,
-`SAVEPOINT`, `RELEASE`, `ROLLBACK`, and `PRAGMA schema_version` are the
-writer's own SQL. They add no user table.
-
-An insert or a delete wakes every watch of that table. An update wakes
-a watch when the updated column is one the query reads. `count(*)`
-wakes on insert and delete only. After `COMMIT`, every matching watch
-on one asyncio loop is set in one wake.
-
-A write to `messages` does not wake a watch of `users`. An update of
-`users.seen` does not wake `SELECT name FROM users`. The watch reads
-again on this thread's read connection. Equal rows do not yield. A
-rolled-back batch does not wake anyone. A schema change wakes every
-watch. A view, a CTE, and raw SQL text all work, because SQLite
-resolves them to base columns.
-
-## Install
-
-CPython 3.14. The package is pure Python. `pip install litewriter` also
-installs APSW. A `v*` tag on the package repository publishes it.
-
-```text
-pip install litewriter
+```python
+async with db.watch(q, room=8) as live:
+    async for rows in live:
+        render(rows)
 ```
 
-From a checkout of this package:
+- The first item is the rows now. The next item comes after a commit that changed them.
+- When the watch opens, SQLite reports the tables and columns that `q` reads. During a commit, the writer records the tables and columns it writes. A match reads `q` again.
+- An insert or a delete wakes every watch on that table. An update wakes a watch only when it reads the updated column.
+- Equal rows do not yield. A slow consumer gets the newest rows, not a backlog. The raw rows are compared first; the `into` objects are built only when they change.
+- Only commits through this `LiteWriter` wake a watch. A write from another process does not.
+- `close()` ends every watch. A watch does not yield the rows of the final batch.
+- Two open watches on the same query and parameters share one re-read per commit.
+- `ATTACH` or `DETACH` in a write wakes every open watch: their reach is not tracked.
+- Joins, views, CTEs, and raw SQL text all work, because SQLite resolves them to base columns.
+- Watches cost nothing while none is open: the writer records changes only while a watch exists.
+- `db.watch(q, Message, room=8)` builds rows the same way as `db.query`.
+
+## Query builder
+
+The builder is optional. SQL text works everywhere. Use the builder when you compose one query into several.
+
+```python
+from litewriter import Select, col, fn, param
+
+page = Select(
+    col("m.id"),
+    col("m.body"),
+    fn("lower", col("u.name")).as_("author"),
+    from_=col("messages").as_("m"),
+    join=("left", col("users").as_("u"), col("m.author") == col("u.id")),
+    where=col("m.room") == param("room"),
+    order_by=col("m.at").desc(),
+    limit=50,
+)
+mine = page.where(col("m.author") == param("me")).limit(20)
+print(mine.sql)
+```
+
+```text
+SELECT m.id, m.body, lower(u.name) AS author FROM messages AS m LEFT JOIN users AS u ON m.author = u.id WHERE m.room = :room AND m.author = :me ORDER BY m.at DESC LIMIT :_1
+```
+
+### Build once, run many
+
+A statement compiles its SQL on first use and keeps it. Later runs only bind parameters, so a built statement costs the same as SQL text. Build it at module level: a new statement per call compiles again each time.
+
+```python
+from litewriter import Insert, Update, col, param
+
+ADD = Insert("messages", columns=["room", "body"], returning="id")
+MOVE = Update("messages", set=["room"], where=col("id") == param("id"))
+
+print(ADD.sql)
+print(MOVE.sql)
+```
+
+```text
+INSERT INTO messages (room, body) VALUES (:room, :body) RETURNING id
+UPDATE messages SET room = :room WHERE id = :id
+```
+
+Inside a write, parameters fill the named slots:
+
+```python
+new_id = tx.value(ADD, room=1, body="hi")
+tx.execute(MOVE, room=2, id=7)
+tx.executemany(ADD, [{"room": 1, "body": "a"}, {"room": 1, "body": "b"}])
+```
+
+`tx.executemany` needs named parameters — `columns=[...]` or `param()` on a builder, `:name` in SQL text. Every row key must be one of those names, so a row can never be ignored. A statement that is all literal values has no parameter for a row to fill; it raises `QueryError` — run it once with `tx.execute`.
+
+A name list is a column and a parameter in one word. Put every changing value in `param()` or a name list, so the text stays the same.
+
+In a value position every Python value binds as a parameter; nothing is pasted into the SQL, so two statements that differ only in values share one cached statement:
+
+```python
+from litewriter import Insert
+
+add = Insert("users", values={"name": "Ada", "age": 36}, returning="id")
+print(add.sql, add.params)
+```
+
+```text
+INSERT INTO users (name, age) VALUES (:_1, :_2) RETURNING id {'_1': 'Ada', '_2': 36}
+```
+
+- A statement is immutable. `.where()` returns a new statement and adds its condition with `AND`.
+- A string in the select list, `from_`, `order_by`, or a column key is a name. A string anywhere else is data, bound as `:_1`, `:_2`, …. In a value position every Python value binds; `None` is `NULL`; `lit()` and `raw()` are the only inline text. In a name position a number, bytes, or a bool renders as a SQL literal — `order_by=1` renders `ORDER BY 1`, which keeps its SQLite meaning.
+- `col("u.name")` is a name in a value position. `param("room")` is `:room`, filled when you run the query. `lit("open")` is the inline `'open'`. `raw("random()")` is verbatim SQL.
+- Operators build expressions: `==`, `<`, `+`, `.in_()`, `.like()`, `.between()`, `.is_(None)`, `.desc()`.
+- Python cannot overload `and` and `or`. `&` is `AND`, `|` is `OR`, `~` is `NOT`: `(a | b) & ~c`.
+- `fn` is every SQLite function: `fn("lower", col("name"))` is `lower(name)`, and so is a function you register.
+- The editor suggests SQLite's built-in names inside `fn("` — a registered function's name works the same way.
+- A `Select` nests anywhere: `from_=inner.as_("s")`, `col("id").in_(inner)`, `inner.exists()`.
+- `Insert`, `Update`, and `Delete` follow the same pattern. `.union()`, `.union_all()`, `.intersect()`, and `.except_()` chain two selects.
+- Name lists make the build-once shorthands: `Insert("t", columns=["a", "b"])` binds `:a` and `:b`, `set=["a"]` binds `:a`, and `do_update=["a"]` sets `a = excluded.a`. The `.set(...)` and `.do_update(...)` methods mix positional names with keyword assigns.
+- `col("x") == None` raises, because `= NULL` never matches. Write `col("x").is_(None)`.
+
+## Lifecycle
+
+```python
+async with LiteWriter(path, schema=SCHEMA, claim=30) as db:
+    ...
+```
+
+`async with` starts the writer. Start and close run off the event loop. The exit drains the queue, commits the last batch, and folds the WAL. `:memory:` is not supported: every thread opens its own read connection, and one file is required.
+
+`schema=` runs once at start, in one transaction, before the first write. It is SQL text, or a function `fn(tx)` when a migration needs to look before it changes something.
+
+`claim=30` takes an exclusive lock on `{path}-claim` before it starts. It waits up to 30 s, then raises `ClaimBusy`. Use it so two copies of an app (the old one and the new one during a deploy) never write one file. Close releases the lock. The kernel releases it when the process dies.
+
+Every connection uses WAL, `synchronous=NORMAL`, `foreign_keys=ON`, a 64 MiB page cache, and a 1 GiB memory map.
+
+## Errors
+
+| Error | Meaning |
+| --- | --- |
+| `LiteError` | the base of the three below |
+| `QueryError` | a bad call: a missing parameter, a bad builder input, `into` that cannot build a row, an async write function, or no row for `value()` |
+| `StateError` | the right call at the wrong time: not started, closed, a blocked loop, or a `db` read on the writer thread |
+| `ClaimBusy` | another process holds the claim |
+
+SQLite errors pass through as `apsw.Error` subclasses — `apsw.ConstraintError` from a write, `apsw.SQLError` for bad SQL. Catch them from `apsw`.
+
+## Development
 
 ```text
 uv sync
 uv run pytest
 ```
-
-## Threads
-
-`submit`, `call`, and `push` are safe from any OS thread. The writer
-owns the write connection. Each OS thread reads on its own connection.
-A `reader()` stays on the thread that opened it. Jobs sit on a deque
-and a Condition. After `COMMIT` the writer wakes each asyncio loop once per batch.
-A socketpair mailbox does that when the loop has `add_reader`.
-The Windows loop has no `add_reader`. One callback then carries the
-batch. Matching watches on that loop are set in that same wake.
-The mailbox is made on the loop's own thread (the first `call` or
-`watch` there), because `add_reader` is not thread-safe.
-
-Each connection has a 64 MiB page cache and maps up to 1 GiB of the file
-(`litewriter.connect.CACHE_KIB`, `MMAP_BYTES`).

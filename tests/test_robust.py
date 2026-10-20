@@ -22,7 +22,7 @@ from litewriter import LiteWriter
 path, tag, count = sys.argv[1], sys.argv[2], int(sys.argv[3])
 
 def add(tx, body):
-    tx.execute("INSERT INTO t(body) VALUES (?)", (body,))
+    tx.execute("INSERT INTO t(body) VALUES (:body)", body=body)
 
 with LiteWriter(path, hz=0) as db:
     for i in range(count):
@@ -32,7 +32,7 @@ with LiteWriter(path, hz=0) as db:
 
 
 def add(tx: Tx, body: str) -> None:
-    tx.execute("INSERT INTO t(body) VALUES (?)", (body,))
+    tx.execute("INSERT INTO t(body) VALUES (:body)", body=body)
 
 
 def _child_env() -> dict[str, str]:
@@ -67,8 +67,8 @@ def _count(path: Path) -> int:
 
 def test_three_processes_write_one_file(tmp_path: Path) -> None:
     path = tmp_path / "shared.sqlite3"
-    with LiteWriter(path, hz=0) as db:
-        db.execute_script(SCHEMA)
+    with LiteWriter(path, hz=0, schema=SCHEMA):
+        pass
     procs = [_spawn(path, tag, 200) for tag in ("a", "b", "c")]
     for proc in procs:
         proc.communicate(timeout=60)
@@ -78,8 +78,8 @@ def test_three_processes_write_one_file(tmp_path: Path) -> None:
 
 def test_acknowledged_writes_survive_a_killed_process(tmp_path: Path) -> None:
     path = tmp_path / "crash.sqlite3"
-    with LiteWriter(path, hz=0) as db:
-        db.execute_script(SCHEMA)
+    with LiteWriter(path, hz=0, schema=SCHEMA):
+        pass
     proc = _spawn(path, "k", 100_000)
     assert proc.stdout is not None
     acknowledged = 0
@@ -120,8 +120,7 @@ def _integrity(path: Path) -> None:
 
 def test_many_threads_submit(tmp_path: Path) -> None:
     path = tmp_path / "threads.sqlite3"
-    with LiteWriter(path, hz=0) as db:
-        db.execute_script(SCHEMA)
+    with LiteWriter(path, hz=0, schema=SCHEMA) as db:
 
         def work(tag: int) -> None:
             for i in range(250):
@@ -138,25 +137,23 @@ def test_many_threads_submit(tmp_path: Path) -> None:
 
 async def test_a_large_batch_commits_once_and_in_order(tmp_path: Path) -> None:
     path = tmp_path / "big.sqlite3"
-    async with LiteWriter(path, hz=0) as db:
-        db.execute_script(SCHEMA)
+    async with LiteWriter(path, hz=0, schema=SCHEMA) as db:
         for i in range(20_000):
             db.push(add, str(i))
-        await db.call(add, "last")
+        await db.write(add, "last")
         first = db.query("SELECT body FROM t ORDER BY id LIMIT 3")
         total = db.query("SELECT count(*) FROM t")
     assert first == [("0",), ("1",), ("2",)]
     assert total == [(20_001,)]
 
 
-async def test_close_while_calls_are_waiting(tmp_path: Path) -> None:
+async def test_close_while_writes_are_waiting(tmp_path: Path) -> None:
     path = tmp_path / "late.sqlite3"
-    db = LiteWriter(path, hz=0)
+    db = LiteWriter(path, hz=0, schema=SCHEMA)
     db.start()
-    db.execute_script(SCHEMA)
-    tasks = [asyncio.create_task(db.call(add, str(i))) for i in range(200)]
+    tasks = [asyncio.create_task(db.write(add, str(i))) for i in range(200)]
     await asyncio.sleep(0)
-    db.close()
+    await asyncio.to_thread(db.close)
     outcomes = await asyncio.gather(*tasks, return_exceptions=True)
     done = [item for item in outcomes if not isinstance(item, BaseException)]
     assert _count(path) == len(done)

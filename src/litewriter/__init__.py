@@ -1,58 +1,33 @@
-"""One SQLite writer thread. Queries are data. Reads stay on the calling thread.
+"""One SQLite writer thread. Group commit. Reads stay on the calling thread.
 
-CPython 3.14. ``isolated=True`` is the default. A watch wakes after a
-commit that changes a column it reads.
+CPython 3.14. Every job runs in its own savepoint. A watch wakes after
+a commit that changes a column it reads.
 """
 
-from litewriter.build import (
-    Delete,
-    Except,
-    Insert,
-    Intersect,
-    Query,
-    Select,
-    Union,
-    UnionAll,
-    Update,
-)
-from litewriter.connect import connect
-from litewriter.errors import WriterBusy, WriterError, WriterRolledBack, WriterRuntime
-from litewriter.expr import Expr, col, exists, lit, not_exists, param
-from litewriter.fn import Isolated, Tx, WriteFn, isolated
-from litewriter.q import sql, where
+from litewriter.build import Delete, Insert, Select, Update
+from litewriter.errors import ClaimBusy, LiteError, QueryError, StateError
+from litewriter.expr import BuiltinName, case, col, fn, lit, param, raw
+from litewriter.tx import Tx
 from litewriter.watch import Watch
-from litewriter.writer import LiteWriter, Outcome, Reader, Stats
+from litewriter.writer import LiteWriter
 
 __all__ = [
+    "BuiltinName",
+    "ClaimBusy",
     "Delete",
-    "Except",
-    "Expr",
     "Insert",
-    "Intersect",
-    "Isolated",
+    "LiteError",
     "LiteWriter",
-    "Outcome",
-    "Query",
-    "Reader",
+    "QueryError",
     "Select",
-    "Stats",
+    "StateError",
     "Tx",
-    "Union",
-    "UnionAll",
     "Update",
     "Watch",
-    "WriteFn",
-    "WriterBusy",
-    "WriterError",
-    "WriterRolledBack",
-    "WriterRuntime",
+    "case",
     "col",
-    "connect",
-    "exists",
-    "isolated",
+    "fn",
     "lit",
-    "not_exists",
     "param",
-    "sql",
-    "where",
+    "raw",
 ]

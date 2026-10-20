@@ -1,4 +1,5 @@
-from collections.abc import Mapping
+from collections.abc import Sequence
+from typing import cast
 
 import pytest
 
@@ -6,326 +7,241 @@ from litewriter import (
     Delete,
     Insert,
     LiteWriter,
+    QueryError,
     Select,
-    UnionAll,
     Update,
-    WriterError,
     col,
-    exists,
     lit,
     param,
-    sql,
 )
+from litewriter.build import Compound, JoinSpec, _Join
+from litewriter.expr import Expr
 
 
-def test_page_matches_hand_written_sql() -> None:
+def test_constructor_and_chained_methods_agree() -> None:
     page = Select(
         "m.id",
         "m.body",
-        ("as", ("lower", "u.name"), "author"),
-        from_=("as", "messages", "m"),
-        join=("left", ("as", "users", "u"), ("=", "m.author", "u.id")),
-        where=("=", "m.room", ":room"),
-        order_by=("desc", "m.at"),
+        from_="messages",
+        join=("left", "users", col("m.author") == col("u.id")),
+        where=col("m.room") == param("room"),
+        order_by=col("m.at").desc(),
         limit=50,
     )
     chained = (
-        Select("m.id", "m.body", ("as", ("lower", "u.name"), "author"))
-        .from_(("as", "messages", "m"))
-        .left_join(("as", "users", "u"), ("=", "m.author", "u.id"))
-        .where(("=", "m.room", ":room"))
-        .order_by(("desc", "m.at"))
+        Select("m.id", "m.body")
+        .from_("messages")
+        .join("left", "users", col("m.author") == col("u.id"))
+        .where(col("m.room") == param("room"))
+        .order_by(col("m.at").desc())
         .limit(50)
     )
-    assert (
-        sql(page)
-        == sql(chained)
-        == (
-            "SELECT m.id, m.body, lower(u.name) AS author"
-            " FROM messages AS m"
-            " LEFT JOIN users AS u ON m.author = u.id"
-            " WHERE m.room = :room"
-            " ORDER BY m.at DESC LIMIT 50"
-        )
-    )
+    assert page.sql == chained.sql
 
 
-def test_later_edits_do_not_change_the_query() -> None:
-    call = ["lower", "u.name"]
-    row: dict[str, object] = {"body": ":body"}
-    page = Select(call, from_="t")
-    added = Insert("t", values=row)
-    call.append("x")
-    row["room"] = 1
-    assert sql(page) == "SELECT lower(u.name) FROM t"
-    assert sql(added) == "INSERT INTO t (body) VALUES (:body)"
-
-
-def test_a_list_of_conditions_is_and() -> None:
-    page = Select(
-        "id",
-        from_="t",
-        where=[("=", "room", ":room"), (">", "at", 0)],
-        order_by=[("desc", "at"), "id"],
-        group_by=["room", "id"],
-    )
-    assert sql(page) == (
-        "SELECT id FROM t WHERE room = :room AND at > 0"
-        " GROUP BY room, id ORDER BY at DESC, id"
-    )
-
-
-def test_where_returns_a_new_query() -> None:
+def test_methods_return_a_new_statement() -> None:
     page = Select("id", from_="t", limit=50)
-    mine = page.where(("=", "author", ":me")).limit(20)
-    assert sql(page) == "SELECT id FROM t LIMIT 50"
-    assert sql(mine) == "SELECT id FROM t WHERE author = :me LIMIT 20"
+    mine = page.where(col("author") == param("me")).limit(20)
+    assert page.sql == "SELECT id FROM t LIMIT :_1"
+    assert page.params == {"_1": 50}
+    assert mine.sql == "SELECT id FROM t WHERE author = :me LIMIT :_1"
+    assert mine.params == {"_1": 20}
 
 
-def test_a_call_means_the_same_in_every_clause() -> None:
-    q = Select(("count", "author")).from_("t").where(("lower", "name"))
-    assert sql(q) == "SELECT count(author) FROM t WHERE lower(name)"
+def test_inputs_are_snapshotted() -> None:
+    row: dict[str, str | int] = {"body": "b"}
+    added = Insert("t", values=row)
+    row["room"] = 1
+    assert added.sql == "INSERT INTO t (body) VALUES (:_1)"
+    items = ["id"]
+    q = Select(*items, from_="t")
+    items.append("evil")
+    assert q.sql == "SELECT id FROM t"
 
 
-def test_an_alias_means_the_same_in_every_clause() -> None:
-    q = Select(("as", ("count", "author"), "n")).from_(("as", "t", "x"))
-    assert sql(q) == "SELECT count(author) AS n FROM t AS x"
-    deleted = Delete("t").returning(("as", "id", "gone"))
-    assert sql(deleted) == "DELETE FROM t RETURNING id AS gone"
-
-
-def test_a_literal_form_quotes_text() -> None:
-    q = Select(("lit", "it's")).from_("t")
-    assert sql(q) == "SELECT 'it''s' FROM t"
-
-
-def test_a_list_is_the_same_call() -> None:
-    tupled = Select(("lower", "u.name")).from_("t")
-    listed = Select(["lower", "u.name"]).from_("t")
-    assert sql(tupled) == sql(listed) == "SELECT lower(u.name) FROM t"
-
-
-def test_forms() -> None:
-    rooms = Select(1).from_("rooms").where(("=", "rooms.id", "t.room"))
+def test_joins() -> None:
     q = (
-        Select(
-            ("count", "*"),
-            ("count", ("distinct", "author")),
-            ("cast", "n", "integer"),
-            ("case", ("=", "status", "'open'"), 1, 0),
-            ("collate", "name", "nocase"),
-        )
-        .from_("t")
-        .where(
-            ("in", "status", "'open'", "'done'"),
-            ("between", "at", ":lo", ":hi"),
-            ("is not", "deleted_at", None),
-            ("exists", rooms),
-        )
-        .group_by("status")
-        .having((">", ("count", "*"), 1))
-        .order_by(("desc", "at", "nulls last"), ("raw", "random()"))
-        .offset(10)
+        Select("a.id", from_="a")
+        .join("left", "b", col("a.id") == col("b.id"))
+        .join("cross", "c")
     )
-    assert sql(q) == (
-        "SELECT count(*), count(DISTINCT author), CAST(n AS INTEGER),"
-        " CASE WHEN status = 'open' THEN 1 ELSE 0 END, name COLLATE NOCASE"
-        " FROM t"
-        " WHERE status IN ('open', 'done') AND at BETWEEN :lo AND :hi"
-        " AND deleted_at IS NOT NULL"
-        " AND EXISTS (SELECT 1 FROM rooms WHERE rooms.id = t.room)"
-        " GROUP BY status HAVING count(*) > 1"
-        " ORDER BY at DESC NULLS LAST, random() LIMIT -1 OFFSET 10"
+    assert q.sql == ("SELECT a.id FROM a LEFT JOIN b ON a.id = b.id CROSS JOIN c")
+    both = Select(
+        "a.id",
+        from_="a",
+        join=[
+            ("inner", "b", col("a.id") == col("b.a")),
+            ("cross", "c"),
+        ],
     )
+    assert both.sql == ("SELECT a.id FROM a JOIN b ON a.id = b.a CROSS JOIN c")
 
 
-def test_and_or_not() -> None:
-    cond = (
-        "or",
-        ("and", ("=", "a", 1), ("=", "b", 2)),
-        ("not", (">", "c", ("+", "d", 1))),
-    )
-    assert sql(Select("*").from_("t").where(cond)) == (
-        "SELECT * FROM t WHERE a = 1 AND b = 2 OR NOT c > d + 1"
-    )
+def test_join_kind_is_checked() -> None:
+    bad = cast(_Join, "sideways")
+    with pytest.raises(QueryError, match="join kind"):
+        Select("id", from_="t").join(bad, "u", col("a") == col("b"))
+    with pytest.raises(QueryError, match="join"):
+        _ = Select("id", from_="t", join=cast("JoinSpec", ("inner", "u"))).sql
 
 
-def test_arbitrary_function() -> None:
-    q = Select(("json_extract", "body", "'$.n'"), ("my_fn", 1, 2.5)).from_("t")
-    assert sql(q) == "SELECT json_extract(body, '$.n'), my_fn(1, 2.5) FROM t"
+def test_distinct_and_group_by() -> None:
+    q = Select("room", distinct=True, from_="t", group_by="room")
+    assert q.sql == "SELECT DISTINCT room FROM t GROUP BY room"
 
 
-def test_writes() -> None:
-    added = Insert(
-        "messages",
-        values={"room": ":room", "body": ":body"},
-        on_conflict=["id"],
-        do_update={"body": "excluded.body"},
-        returning="id",
-    )
-    chained = (
-        Insert("messages")
-        .values({"room": ":room", "body": ":body"})
-        .on_conflict("id")
-        .do_update(body="excluded.body")
+def test_update_and_delete() -> None:
+    changed = (
+        Update("t", set={"body": "b"})
+        .set(done=1)
+        .where(col("id") == param("id"))
         .returning("id")
     )
-    assert (
-        sql(added)
-        == sql(chained)
-        == (
-            "INSERT INTO messages (room, body) VALUES (:room, :body)"
-            " ON CONFLICT (id) DO UPDATE SET body = excluded.body RETURNING id"
-        )
-    )
-    changed = Update("t", set={"body": ":body"}, where=("=", "id", ":id"))
-    assert sql(changed) == "UPDATE t SET body = :body WHERE id = :id"
-    removed = Delete("t", where=("<", "at", ":before"), returning="id")
-    assert sql(removed) == "DELETE FROM t WHERE at < :before RETURNING id"
-    distinct = Select("id", distinct=True, from_="t")
-    assert sql(distinct) == "SELECT DISTINCT id FROM t"
+    assert changed.sql == "UPDATE t SET done = :_1 WHERE id = :id RETURNING id"
+    assert changed.params == {"_1": 1}
+    removed = Delete("t", where=col("at") < param("before"), returning="id")
+    assert removed.sql == "DELETE FROM t WHERE at < :before RETURNING id"
+    chained = Delete("t").where(col("id") == 1).returning("id", "body")
+    assert chained.sql == "DELETE FROM t WHERE id = :_1 RETURNING id, body"
 
 
-def test_union_and_table_function() -> None:
-    recent = Select("id", from_="messages", where=(">", "at", ":since"))
-    q = UnionAll(
-        Select("id", from_="recent"),
-        Select("value", from_=("json_each", ":ids")),
-        with_={"recent": recent},
-        limit=5,
+def test_update_can_join() -> None:
+    q = Update(
+        "t",
+        set={"body": "x"},
+        from_="u",
+        join=("inner", "v", col("v.id") == col("t.v")),
     )
-    chained = (
-        UnionAll(
-            Select("id", from_="recent"),
-            Select("value", from_=("json_each", ":ids")),
-        )
-        .with_("recent", recent)
-        .limit(5)
-    )
-    assert (
-        sql(q)
-        == sql(chained)
-        == (
-            "WITH recent AS (SELECT id FROM messages WHERE at > :since)"
-            " SELECT id FROM recent UNION ALL SELECT value FROM json_each(:ids) LIMIT 5"
-        )
-    )
+    assert q.sql == "UPDATE t SET body = :_1 FROM u JOIN v ON v.id = t.v"
 
 
-def test_a_select_nests() -> None:
-    inner = Select("id", "body", from_="t", where=(">", "id", 0))
-    mid = Select("id", from_=("as", inner, "i"), limit=5)
-    outer = Select(
-        "m.id",
-        ("as", Select(("count", "*"), from_="t"), "n"),
-        from_=("as", mid, "m"),
-        where=("in", "m.id", Select("id", from_="t")),
-    ).left_join(("as", Select("id", from_="t"), "s"), ("=", "m.id", "s.id"))
-    assert sql(outer) == (
-        "SELECT m.id, (SELECT count(*) FROM t) AS n"
-        " FROM (SELECT id FROM (SELECT id, body FROM t WHERE id > 0) AS i LIMIT 5) AS m"
-        " LEFT JOIN (SELECT id FROM t) AS s ON m.id = s.id"
-        " WHERE m.id IN (SELECT id FROM t)"
-    )
+def test_insert_columns() -> None:
+    q = Insert("t", columns=["a", "b"], values={"a": 1, "b": "x"})
+    assert q.sql == "INSERT INTO t (a, b) VALUES (:_1, :_2)"
+    assert q.params == {"_1": 1, "_2": "x"}
+    with pytest.raises(QueryError, match="differ"):
+        _ = Insert("t", columns=["a"], values={"b": 1}).sql
 
 
-def test_a_limited_arm_is_a_nested_select() -> None:
-    page = UnionAll(
-        Select("body", from_="t"),
-        Select("body", from_=Select("body", from_="t", where=("=", "id", 1), limit=1)),
-    )
-    assert sql(page) == (
-        "SELECT body FROM t"
-        " UNION ALL SELECT body FROM (SELECT body FROM t WHERE id = 1 LIMIT 1)"
+def test_select_can_be_replaced() -> None:
+    q = Select("a", distinct=True, from_="t").select("b", "c")
+    assert q.sql == "SELECT b, c FROM t"
+
+
+def test_with_recursive() -> None:
+    walk = Select("id", from_="t")
+    q = Select("id", from_="walk", with_={"walk": walk}, recursive=True)
+    assert q.sql == "WITH RECURSIVE walk AS (SELECT id FROM t) SELECT id FROM walk"
+    other = Select("id", from_="w").with_recursive("w", walk)
+    assert other.sql.startswith("WITH RECURSIVE")
+    both = Select("id", from_="t")
+    with pytest.raises(QueryError, match="not both"):
+        both.with_("a", walk).with_recursive("b", walk)
+
+
+def test_statement_repr_is_the_sql() -> None:
+    q = Select("id", from_="t")
+    assert "SELECT id FROM t" in repr(q)
+
+
+def test_compound_is_private_but_chainable() -> None:
+    q = Select("id", from_="a").union(Select("id", from_="b"))
+    assert isinstance(q, Compound)
+    assert not hasattr(__import__("litewriter"), "Compound")
+    more = q.union_all(Select("id", from_="c")).except_(Select("id", from_="d"))
+    assert more.sql == (
+        "SELECT id FROM a UNION SELECT id FROM b"
+        " UNION ALL SELECT id FROM c EXCEPT SELECT id FROM d"
     )
 
 
-def test_expressions_match_the_tuples() -> None:
-    inner = Select("id", "body", from_="t", where=col("id") > 0)
-    page = Select(
-        col("m.id"),
-        col("body").as_("text"),
-        (col("n") + 1) * 2,
-        from_=inner.as_("m"),
-        where=[
-            col("m.room") == param("room"),
-            col("body").like(param("q")),
-            col("id").in_(Select("id", from_="rooms")),
-            col("deleted_at").is_(None),
-        ],
-        order_by=col("m.at").desc("nulls last"),
-    )
-    assert sql(page) == (
-        "SELECT m.id, body AS text, (n + 1) * 2"
-        " FROM (SELECT id, body FROM t WHERE id > 0) AS m"
-        " WHERE m.room = :room AND body LIKE :q"
-        " AND id IN (SELECT id FROM rooms)"
-        " AND deleted_at IS NULL"
-        " ORDER BY m.at DESC NULLS LAST"
-    )
+def test_insert_needs_values_or_select() -> None:
+    with pytest.raises(QueryError, match="values or select"):
+        Insert("t", values={"a": 1}, select=Select("a", from_="u"))
+    with pytest.raises(QueryError, match="needs"):
+        _ = Insert("t").sql
 
 
-def test_literals_and_reflected_operators() -> None:
-    assert sql(Select(lit("it's"))) == "SELECT 'it''s'"
-    assert sql(Select(1 + col("n"))) == "SELECT 1 + n"
-    assert sql(Select(2 - col("n"))) == "SELECT 2 - n"
-    assert sql(Select(col("flags") & 1)) == "SELECT flags & 1"
-    assert (
-        sql(Select(exists(Select(1, from_="t")))) == "SELECT EXISTS (SELECT 1 FROM t)"
-    )
-
-
-def test_an_expression_has_no_truth_value() -> None:
-    with pytest.raises(TypeError):
-        bool(col("id") == 1)
-
-
-def test_a_comparison_with_none_raises() -> None:
-    with pytest.raises(WriterError, match="None"):
-        col("deleted_at").__eq__(None)
-    with pytest.raises(WriterError, match="None"):
-        col("n").__lt__(None)
-    assert sql(Select(col("deleted_at").is_(None))) == "SELECT deleted_at IS NULL"
-    assert sql(Select(None)) == "SELECT NULL"
-
-
-def _defines(cls: type, name: str) -> bool:
-    for base in cls.__mro__:
-        if name in base.__dict__:
-            return base not in {Mapping, object}
-    return False
-
-
-def test_each_statement_has_its_own_methods() -> None:
-    assert _defines(Select, "from_")
-    assert _defines(Select, "group_by")
-    assert not _defines(Select, "values")
-    assert _defines(Insert, "values")
-    assert _defines(Insert, "do_nothing")
-    assert not _defines(Insert, "from_")
-    assert _defines(Update, "set")
-    assert _defines(Update, "from_")
-    assert not _defines(Update, "group_by")
-    assert _defines(Delete, "where")
-    assert not _defines(Delete, "from_")
-    assert _defines(UnionAll, "limit")
-    assert not _defines(UnionAll, "where")
-    assert _defines(Delete, "as_")
+def test_values_must_be_mappings() -> None:
+    with pytest.raises(QueryError, match="dict"):
+        Insert("t", values=cast("list", [[1, 2]]))
+    with pytest.raises(QueryError, match="non-empty"):
+        Insert("t", values=[])
 
 
 def test_query_runs(db: LiteWriter) -> None:
-    db.execute_script("INSERT INTO t (body) VALUES ('hi')")
-    found = db.query(
-        Select("body").from_("t").where(("=", "body", ":body")),
-        body="hi",
-    )
-    assert found == [("hi",)]
-    db.execute_script("INSERT INTO t (body) VALUES ('a'), ('b')")
-    inner = Select("id", "body", from_="t", where=("!=", "body", "'hi'"))
-    found = db.query(Select("s.body", from_=("as", inner, "s"), order_by="s.id"))
+    db.submit(
+        lambda tx: tx.execute("INSERT INTO t (body) VALUES ('hi'), ('a'), ('b')")
+    ).result()
+    inner = Select("id", "body", from_="t", where=col("body") != lit("hi"))
+    found = db.query(Select("s.body", from_=inner.as_("s"), order_by="s.id"))
     assert found == [("a",), ("b",)]
 
 
-def test_compound_needs_two_queries() -> None:
-    with pytest.raises(WriterError, match="two"):
-        UnionAll(Select("id"))
+def test_an_insert_from_names() -> None:
+    add = Insert("users", columns=["name", "age"], returning="id")
+    assert add.sql == (
+        "INSERT INTO users (name, age) VALUES (:name, :age) RETURNING id"
+    )
+    assert add.params == {}
+    chained = Insert("users").columns("name", "age").returning("id")
+    assert chained.sql == add.sql
+
+
+def test_an_update_from_names() -> None:
+    move = Update("t", set=["name", "age"], where=col("id") == param("id"))
+    assert move.sql == "UPDATE t SET name = :name, age = :age WHERE id = :id"
+    assert move.params == {}
+    one = Update("t", set="name")
+    assert one.sql == "UPDATE t SET name = :name"
+    mixed = Update("t", set={"a": 1}).set("name", age=5)
+    assert mixed.sql == "UPDATE t SET name = :name, age = :_1"
+    assert mixed.params == {"_1": 5}
+
+
+def test_an_upsert_from_names() -> None:
+    add = Insert("u", columns=["email", "n"], on_conflict="email", do_update=["n"])
+    assert add.sql == (
+        "INSERT INTO u (email, n) VALUES (:email, :n)"
+        " ON CONFLICT (email) DO UPDATE SET n = excluded.n"
+    )
+    assert add.params == {}
+    chained = Insert("u").columns("email", "n").on_conflict("email").do_update("n")
+    assert chained.sql == add.sql
+
+
+def test_a_compiled_statement_is_shared() -> None:
+    q = Update("t", set=["body"], where=col("id") == param("id"))
+    assert q.sql is q.sql
+    assert q._compiled() is q._compiled()
+    leaked = q.params
+    leaked["bogus"] = 1
+    assert q._compiled()[1] == {}
+
+
+def test_name_shorthands_are_checked() -> None:
+    with pytest.raises(QueryError, match="name"):
+        Insert("t", columns=["_1"])
+    with pytest.raises(QueryError, match="name"):
+        Update("t", set=cast("Sequence[str]", [1]))
+    with pytest.raises(QueryError, match="name"):
+        Update("t", set={"a": 1}).set("_2")
+    with pytest.raises(QueryError, match="name"):
+        Insert("t", columns=["email"]).on_conflict("email").do_update("_3")
+
+
+def test_a_none_condition_raises() -> None:
+    with pytest.raises(QueryError, match="not None"):
+        Select("id", from_="t", where=None)
+    with pytest.raises(QueryError, match="not None"):
+        Select("id", from_="t", having=None)
+    with pytest.raises(QueryError, match="not None"):
+        Select("id", from_="t", where=[col("id") == 1, cast("Expr", None)])
+    with pytest.raises(QueryError, match="not None"):
+        Select("id", from_="t").where(cast("Expr", None))
+    with pytest.raises(QueryError, match="not None"):
+        Select("id", from_="t").having(cast("Expr", None))
+    with pytest.raises(QueryError, match="not None"):
+        Update("t", set={"a": 1}, where=[cast("Expr", None)])
+    with pytest.raises(QueryError, match="not None"):
+        Delete("t").where(cast("Expr", None))
