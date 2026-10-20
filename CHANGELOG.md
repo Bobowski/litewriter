@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1
+
+- Internal cleanup, no public API change: the tracker merged into
+  `watch.py`, `Watch` and `Snapshot` no longer reach into `LiteWriter`,
+  and the internals are fully typed.
+- A `join=` item that is not a tuple raises `QueryError` instead of
+  `IndexError` or `TypeError`.
+- On Windows the claim locks a byte past the pid, so another process
+  can read the holder pid from the claim file.
+
 ## 0.3.0
 
 Breaking changes:
