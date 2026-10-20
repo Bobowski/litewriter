@@ -56,11 +56,13 @@ def test_claim_reports_the_holder_pid(tmp_path: Path) -> None:
     path = tmp_path / "t.sqlite3"
     holder = LiteWriter(path, claim=0)
     holder.start()
-    other = LiteWriter(path, claim=0)
-    with pytest.raises(ClaimBusy, match="holds the claim") as caught:
-        other.start()
-    assert caught.value.context["holder"] == os.getpid()
-    holder.close()
+    try:
+        other = LiteWriter(path, claim=0)
+        with pytest.raises(ClaimBusy, match="holds the claim") as caught:
+            other.start()
+        assert caught.value.context["holder"] == os.getpid()
+    finally:
+        holder.close()
     other.start()
     other.close()
 

@@ -1,4 +1,5 @@
 import asyncio
+import sys
 import threading
 from asyncio import AbstractEventLoop
 from collections.abc import Callable
@@ -266,7 +267,18 @@ def test_a_missing_parent_is_created(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "name", ["a b.sqlite3", "a#b.sqlite3", "a?b.sqlite3", "zażółć.sqlite3"]
+    "name",
+    [
+        "a b.sqlite3",
+        "a#b.sqlite3",
+        pytest.param(
+            "a?b.sqlite3",
+            marks=pytest.mark.skipif(
+                sys.platform == "win32", reason="? cannot appear in a Windows name"
+            ),
+        ),
+        "zażółć.sqlite3",
+    ],
 )
 def test_unusual_file_names(tmp_path: Path, name: str) -> None:
     path = tmp_path / name

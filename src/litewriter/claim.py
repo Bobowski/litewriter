@@ -174,6 +174,8 @@ def _write_pid(fd: int) -> None:
 if sys.platform == "win32":
     import msvcrt
 
+    _LOCK_AT = 1024  # a lock on byte 0 hides the pid from other opens
+
     def _open(path: Path) -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_BINARY, 0o644)
@@ -181,7 +183,7 @@ if sys.platform == "win32":
         return fd
 
     def _try_lock(fd: int) -> bool:
-        os.lseek(fd, 0, os.SEEK_SET)
+        os.lseek(fd, _LOCK_AT, os.SEEK_SET)
         try:
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         except OSError:
@@ -190,7 +192,7 @@ if sys.platform == "win32":
 
     def _unlock_close(fd: int) -> None:
         with suppress(OSError):
-            os.lseek(fd, 0, os.SEEK_SET)
+            os.lseek(fd, _LOCK_AT, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         with suppress(OSError):
             os.close(fd)
