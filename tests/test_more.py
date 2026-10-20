@@ -154,6 +154,22 @@ def test_a_callable_into_as_a_keyword_raises(db: LiteWriter) -> None:
         db.submit(other).result(timeout=1.0)
 
 
+async def test_async_reads_run_on_a_worker_thread(db: LiteWriter) -> None:
+    await db.write(insert, "x")
+    loop_thread = threading.current_thread()
+    seen = []
+    rows = await db.aquery(
+        "SELECT id FROM t", lambda i: seen.append(threading.current_thread()) or i
+    )
+    assert rows == [1]
+    assert seen[0] is not loop_thread
+    assert await db.aone("SELECT body FROM t") == ("x",)
+    assert await db.aone("SELECT body FROM t WHERE id = :id", id=9) is None
+    assert await db.avalue("SELECT count(*) FROM t") == 1
+    with pytest.raises(QueryError, match="into is positional"):
+        await db.aquery("SELECT id FROM t", into=tuple)
+
+
 def test_lite_error_carries_context() -> None:
     exc = QueryError("nope", context={"a": 1}, help_text="try this", example="x()")
     text = str(exc)

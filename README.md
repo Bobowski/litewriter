@@ -106,7 +106,7 @@ db.one(q, **params)     # the first row, or None
 db.value(q, **params)   # the first column of the first row; no row raises
 ```
 
-`q` is SQL text or a builder statement. `:name` in the SQL takes the keyword argument `name`. On a builder statement the names `_1`, `_2`, … are reserved for the values the builder binds; plain SQL text may use `:_1`. A read runs on the calling thread. On an event loop a read holds the loop for its duration, so keep reads short and indexed. Move a big report to `asyncio.to_thread`. A read does not need the writer to be started, but the file must exist.
+`q` is SQL text or a builder statement. `:name` in the SQL takes the keyword argument `name`. On a builder statement the names `_1`, `_2`, … are reserved for the values the builder binds; plain SQL text may use `:_1`. A read runs on the calling thread. On an event loop a read holds the loop for its duration, so keep reads short and indexed. A heavy read (an export, a report over every row) awaits `db.aquery`/`aone`/`avalue`, which run the read on a worker thread. A read does not need the writer to be started, but the file must exist.
 
 Inside a write, reads go through `tx`: `tx.query`, `tx.one`, and `tx.value` see the uncommitted batch. The `db` read calls and `db.snapshot()` raise `StateError` there — `db` reads committed data, so inside a write they would see the world before the batch began.
 

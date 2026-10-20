@@ -445,6 +445,46 @@ class LiteWriter:
             text, bound = merge(q, params)
         return value(run(conn, text, bound))
 
+    @overload
+    async def aquery(
+        self, q: str | Statement, /, **params: object
+    ) -> list[tuple[Any, ...]]: ...
+    @overload
+    async def aquery[T](
+        self, q: str | Statement, into: Callable[..., T], /, **params: object
+    ) -> list[T]: ...
+    async def aquery(
+        self,
+        q: str | Statement,
+        into: Callable[..., Any] = tuple,
+        /,
+        **params: object,
+    ) -> list[Any]:
+        """``query`` on a worker thread — for a read too heavy for the loop."""
+        return await asyncio.to_thread(self.query, q, into, **params)
+
+    @overload
+    async def aone(
+        self, q: str | Statement, /, **params: object
+    ) -> tuple[Any, ...] | None: ...
+    @overload
+    async def aone[T](
+        self, q: str | Statement, into: Callable[..., T], /, **params: object
+    ) -> T | None: ...
+    async def aone(
+        self,
+        q: str | Statement,
+        into: Callable[..., Any] = tuple,
+        /,
+        **params: object,
+    ) -> Any:
+        """``one`` on a worker thread — for a read too heavy for the loop."""
+        return await asyncio.to_thread(self.one, q, into, **params)
+
+    async def avalue(self, q: str | Statement, /, **params: object) -> Any:
+        """``value`` on a worker thread — for a read too heavy for the loop."""
+        return await asyncio.to_thread(self.value, q, **params)
+
     def snapshot(self) -> AbstractContextManager[None]:
         """One fixed read view for the block's reads on this thread.
 

@@ -98,6 +98,9 @@ Builder:
 
 Reads:
 
+- `db.aquery`/`aone`/`avalue` are the async twins of the sync reads:
+  they run the read on a worker thread, for a read too heavy for the
+  loop. Short indexed reads stay on the loop with `db.query`/`one`/`value`.
 - `db.snapshot()` opens a `with` block whose reads on this thread share
   one fixed view. On an event loop the block cannot contain an `await`
   (`StateError`); on a plain thread it holds the view across commits.
