@@ -333,7 +333,9 @@ def set_body(tx: Tx, body: str) -> None:
     tx.execute("UPDATE t SET body = :body WHERE id = 1", body=body)
 
 
-async def test_other_column_does_not_reread(db: LiteWriter) -> None:
+async def test_other_column_does_not_reread(
+    db: LiteWriter, monkeypatch: pytest.MonkeyPatch
+) -> None:
     def alter(tx: Tx) -> None:
         tx.execute("ALTER TABLE t ADD COLUMN seen INTEGER NOT NULL DEFAULT 0")
 
@@ -347,23 +349,20 @@ async def test_other_column_does_not_reread(db: LiteWriter) -> None:
         reads += 1
         return original(self)
 
-    Watch._read = counted  # type: ignore[method-assign]
-    try:
-        async with db.watch("SELECT body FROM t WHERE id = 1") as live:
-            it = aiter(live)
-            assert await anext(it) == [("hi",)]
-            assert reads == 1
-            waiter = asyncio.create_task(anext(it))
-            await asyncio.sleep(0)
-            await db.write(set_seen, 4)
-            await asyncio.sleep(0)
-            assert reads == 1
-            assert not waiter.done()
-            waiter.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await waiter
-    finally:
-        Watch._read = original  # type: ignore[method-assign]
+    monkeypatch.setattr(Watch, "_read", counted)
+    async with db.watch("SELECT body FROM t WHERE id = 1") as live:
+        it = aiter(live)
+        assert await anext(it) == [("hi",)]
+        assert reads == 1
+        waiter = asyncio.create_task(anext(it))
+        await asyncio.sleep(0)
+        await db.write(set_seen, 4)
+        await asyncio.sleep(0)
+        assert reads == 1
+        assert not waiter.done()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
 
 
 async def test_watched_column_wakes(db: LiteWriter) -> None:
@@ -379,7 +378,9 @@ async def test_watched_column_wakes(db: LiteWriter) -> None:
         assert await anext(it) == [("yo",)]
 
 
-async def test_count_ignores_an_update_and_sees_an_insert(db: LiteWriter) -> None:
+async def test_count_ignores_an_update_and_sees_an_insert(
+    db: LiteWriter, monkeypatch: pytest.MonkeyPatch
+) -> None:
     reads = 0
     original = Watch._read
 
@@ -388,25 +389,22 @@ async def test_count_ignores_an_update_and_sees_an_insert(db: LiteWriter) -> Non
         reads += 1
         return original(self)
 
-    Watch._read = counted  # type: ignore[method-assign]
-    try:
-        async with db.watch("SELECT count(*) FROM t") as live:
-            it = aiter(live)
-            assert await anext(it) == [(0,)]
-            assert reads == 1
-            waiter = asyncio.create_task(anext(it))
-            await asyncio.sleep(0)
-            await db.write(rename, "x")
-            await asyncio.sleep(0)
-            assert reads == 1
-            waiter.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await waiter
-            await db.write(insert, "hi")
-            assert await anext(it) == [(1,)]
-            assert reads == 2
-    finally:
-        Watch._read = original  # type: ignore[method-assign]
+    monkeypatch.setattr(Watch, "_read", counted)
+    async with db.watch("SELECT count(*) FROM t") as live:
+        it = aiter(live)
+        assert await anext(it) == [(0,)]
+        assert reads == 1
+        waiter = asyncio.create_task(anext(it))
+        await asyncio.sleep(0)
+        await db.write(rename, "x")
+        await asyncio.sleep(0)
+        assert reads == 1
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        await db.write(insert, "hi")
+        assert await anext(it) == [(1,)]
+        assert reads == 2
 
 
 def test_watch_outside_with_raises(db: LiteWriter) -> None:
@@ -558,7 +556,9 @@ async def test_a_rowid_update_without_an_alias_wakes(db: LiteWriter) -> None:
         assert await asyncio.wait_for(anext(it), 2) == [(2,)]
 
 
-async def test_identical_watches_share_the_reread(db: LiteWriter) -> None:
+async def test_identical_watches_share_the_reread(
+    db: LiteWriter, monkeypatch: pytest.MonkeyPatch
+) -> None:
     reads = 0
     original = Watch._read
 
@@ -567,18 +567,15 @@ async def test_identical_watches_share_the_reread(db: LiteWriter) -> None:
         reads += 1
         return original(self)
 
-    Watch._read = counted  # type: ignore[method-assign]
-    try:
-        async with db.watch(PAGE) as a, db.watch(PAGE) as b:
-            assert await anext(aiter(a)) == []
-            assert await anext(aiter(b)) == []
-            reads = 0
-            await db.write(insert, "x")
-            results = await asyncio.gather(anext(aiter(a)), anext(aiter(b)))
-            assert results == [[(1, "x")], [(1, "x")]]
-            assert reads == 1
-    finally:
-        Watch._read = original  # type: ignore[method-assign]
+    monkeypatch.setattr(Watch, "_read", counted)
+    async with db.watch(PAGE) as a, db.watch(PAGE) as b:
+        assert await anext(aiter(a)) == []
+        assert await anext(aiter(b)) == []
+        reads = 0
+        await db.write(insert, "x")
+        results = await asyncio.gather(anext(aiter(a)), anext(aiter(b)))
+        assert results == [[(1, "x")], [(1, "x")]]
+        assert reads == 1
 
 
 async def test_an_attach_in_a_write_keeps_watches_working(db: LiteWriter) -> None:

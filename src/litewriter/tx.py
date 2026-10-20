@@ -14,25 +14,21 @@ first column of the first row. Use ``tx`` only inside this call. Do not
 store it. Do not block (hash, HTTP, sleep).
 """
 
-# pyright: reportPrivateUsage=false
-
 import itertools
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable
 from threading import current_thread
-from typing import TYPE_CHECKING, Any, cast, overload
+from typing import Any, overload
 
 import apsw
 
 from litewriter.build import Statement
 from litewriter.errors import QueryError, StateError
-from litewriter.expr import _RESERVED, _Stmt
-from litewriter.q import _split, as_into, merge, one, params_in, rows, run, value
-
-if TYPE_CHECKING:
-    from litewriter.track import Tracker
+from litewriter.expr import RESERVED, Stmt, is_params
+from litewriter.q import Params, as_into, merge, one, params_in, rows, run, split, value
+from litewriter.watch import Tracker
 
 
-def _ended() -> StateError:
+def ended_error() -> StateError:
     return StateError(
         "a write function ended the transaction",
         help_text="The writer commits. Do not run BEGIN, COMMIT, END, "
@@ -63,29 +59,30 @@ class Tx:
                 help_text="Do not store it or hand it to another thread.",
             )
         if not self._conn.in_transaction:
-            raise _ended()
+            raise ended_error()
         return self._conn
 
     def _note(
         self,
         conn: apsw.Connection,
         text: str,
-        bound: Mapping[str, object] | None,
+        bound: Params | None,
     ) -> None:
         """Record this statement's write effect while a watch is open."""
         if self._track is not None:
             self._track.note(conn, text, bound)
 
-    def execute(self, q: str | Statement, /, **params: object) -> None:
-        """Run SQL text or a statement to completion. Returns nothing."""
+    def _cursor(self, q: str | Statement, params: dict[str, object]) -> apsw.Cursor:
         conn = self._open()
         text, bound = merge(q, params)
         self._note(conn, text, bound)
-        run(conn, text, bound).fetchall()
+        return run(conn, text, bound)
 
-    def executemany(
-        self, q: str | Statement, rows: Iterable[Mapping[str, object]]
-    ) -> None:
+    def execute(self, q: str | Statement, /, **params: object) -> None:
+        """Run SQL text or a statement to completion. Returns nothing."""
+        self._cursor(q, params).fetchall()
+
+    def executemany(self, q: str | Statement, rows: Iterable[Params]) -> None:
         """Run one statement for each row. Each row fills the ``:name``s.
 
         The statement must take named parameters — ``columns=[...]`` or
@@ -94,8 +91,8 @@ class Tx:
         per row would silently ignore the rows.
         """
         conn = self._open()
-        text, auto = _split(q)
-        built = isinstance(q, _Stmt)
+        text, auto = split(q)
+        built = isinstance(q, Stmt)
         needed = params_in(text)
         fillable = needed - set(auto)
         if not fillable:
@@ -108,19 +105,18 @@ class Tx:
         feed = iter(rows)
         head = next(feed, None)
 
-        def bound() -> Iterable[Mapping[str, object]]:
+        def bound() -> Iterable[Params]:
             pending: Iterable[object] = (
                 feed if head is None else itertools.chain((head,), feed)
             )
-            for item in pending:
-                if not isinstance(item, Mapping):
+            for row in pending:
+                if not is_params(row):
                     raise QueryError(
                         "an executemany row is a dict",
-                        context={"row": item},
+                        context={"row": row},
                     )
-                row = cast("Mapping[str, object]", item)
                 for name in row:
-                    if built and _RESERVED.fullmatch(name):
+                    if built and RESERVED.fullmatch(name):
                         raise QueryError(
                             "a row key is not an auto-bind name",
                             context={"name": name},
@@ -136,9 +132,8 @@ class Tx:
 
         first = head if head is None or not auto else {**auto, **head}
         self._note(conn, text, first)
-        bindings = cast("Iterable[apsw.Bindings]", bound())
         try:
-            conn.executemany(text, bindings).fetchall()
+            conn.executemany(text, bound()).fetchall()
         except KeyError as exc:
             raise QueryError(
                 "missing parameter",
@@ -172,10 +167,7 @@ class Tx:
     ) -> list[Any]:
         """All rows, each built as ``into(*row)``."""
         into = as_into(into)
-        conn = self._open()
-        text, bound = merge(q, params)
-        self._note(conn, text, bound)
-        return rows(run(conn, text, bound), into)
+        return rows(self._cursor(q, params), into)
 
     @overload
     def one(
@@ -194,14 +186,8 @@ class Tx:
     ) -> Any:
         """The first row as ``into(*row)``, or None when there is none."""
         into = as_into(into)
-        conn = self._open()
-        text, bound = merge(q, params)
-        self._note(conn, text, bound)
-        return one(run(conn, text, bound), into)
+        return one(self._cursor(q, params), into)
 
     def value(self, q: str | Statement, /, **params: object) -> Any:
         """The first column of the first row. No row raises QueryError."""
-        conn = self._open()
-        text, bound = merge(q, params)
-        self._note(conn, text, bound)
-        return value(run(conn, text, bound))
+        return value(self._cursor(q, params))

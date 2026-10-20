@@ -11,13 +11,14 @@ from asyncio import InvalidStateError as AsyncSettled
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future, InvalidStateError
+from dataclasses import dataclass
 from threading import Condition
 from typing import Any
 
 from litewriter.errors import QueryError, StateError
 
 
-def _async_write() -> QueryError:
+def async_write_error() -> QueryError:
     return QueryError(
         "a write function is a plain def, not async def",
         help_text="It runs on the writer thread inside the transaction.",
@@ -25,24 +26,15 @@ def _async_write() -> QueryError:
     )
 
 
+@dataclass(slots=True)
 class Job:
     """One write. Built on the caller thread. Run on the writer thread."""
 
-    __slots__ = ("args", "fn", "future", "kwargs", "loop")
-
-    def __init__(
-        self,
-        fn: Callable[..., object],
-        args: tuple[object, ...],
-        kwargs: dict[str, Any],
-        future: Future[Any] | AsyncFuture[Any] | None,
-        loop: AbstractEventLoop | None,
-    ) -> None:
-        self.fn = fn
-        self.args = args
-        self.kwargs = kwargs
-        self.future = future
-        self.loop = loop
+    fn: Callable[..., object]
+    args: tuple[object, ...]
+    kwargs: dict[str, Any]
+    future: Future[Any] | AsyncFuture[Any] | None
+    loop: AbstractEventLoop | None
 
     def run(self, tx: object) -> object:
         if self.kwargs:
@@ -53,7 +45,7 @@ class Job:
             result = self.fn(tx)
         if inspect.iscoroutine(result):
             result.close()
-            raise _async_write()
+            raise async_write_error()
         return result
 
     def claim(self) -> bool:

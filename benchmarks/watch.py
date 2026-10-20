@@ -70,7 +70,7 @@ async def once(path: Path, sample) -> tuple[float, int]:
         reads["n"] += 1
         return original(self)
 
-    Watch._read = counted  # type: ignore[method-assign]
+    Watch._read = counted
     try:
         db = open_db(path)
         try:
@@ -78,7 +78,7 @@ async def once(path: Path, sample) -> tuple[float, int]:
         finally:
             await db.aclose()
     finally:
-        Watch._read = original  # type: ignore[method-assign]
+        Watch._read = original
     return elapsed, reads["n"]
 
 

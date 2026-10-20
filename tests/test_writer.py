@@ -12,7 +12,7 @@ import pytest
 
 from conftest import SCHEMA, boom, insert, one_batch
 from litewriter import LiteWriter, QueryError, StateError, Tx
-from litewriter.track import Tracker
+from litewriter.watch import Tracker
 
 
 def test_hz(tmp_path: Path) -> None:

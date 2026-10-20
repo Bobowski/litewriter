@@ -7,22 +7,19 @@ invalidates the thread-local state; the closed connection drops on the
 next read.
 """
 
-# pyright: reportPrivateUsage=false
-
 import asyncio
 import weakref
+from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock, local
-from typing import TYPE_CHECKING
 
 import apsw
 
 from litewriter.connect import connect
 from litewriter.errors import StateError
-
-if TYPE_CHECKING:
-    from litewriter.writer import LiteWriter
+from litewriter.wake import running_loop
 
 
 def _missing_file() -> StateError:
@@ -45,27 +42,17 @@ def _snapshot_span() -> StateError:
     )
 
 
+@dataclass(slots=True)
 class _ReadState:
     """This thread's read connection and its snapshot bookkeeping."""
 
-    __slots__ = (
-        "conn",
-        "gen",
-        "snap",
-        "snap_broken",
-        "snap_task",
-        "token",
-        "txn",
-    )
-
-    def __init__(self, conn: apsw.Connection, gen: int) -> None:
-        self.conn = conn
-        self.gen = gen
-        self.txn = False
-        self.token = 0
-        self.snap = 0
-        self.snap_task: asyncio.Task[object] | None = None
-        self.snap_broken = False
+    conn: apsw.Connection
+    gen: int
+    txn: bool = False
+    token: int = 0
+    snap: int = 0
+    snap_task: asyncio.Task[object] | None = None
+    snap_broken: bool = False
 
 
 class ThreadReads:
@@ -98,7 +85,7 @@ class ThreadReads:
         st = self._state(path)
         if not st.snap:
             return st.conn
-        loop = asyncio._get_running_loop()
+        loop = running_loop()
         if loop is None:
             return st.conn
         if st.snap_task is not None and (asyncio.current_task() is not st.snap_task):
@@ -140,7 +127,7 @@ class ThreadReads:
             st.conn.execute("COMMIT")
             st.txn = False
 
-    def _snap_enter(self, path: Path) -> None:
+    def snap_enter(self, path: Path) -> None:
         st = self._state(path)
         st.snap += 1
         if st.snap > 1:
@@ -152,7 +139,7 @@ class ThreadReads:
         conn.execute("BEGIN")
         conn.execute("PRAGMA schema_version").fetchall()
         st.txn = True
-        loop = asyncio._get_running_loop()
+        loop = running_loop()
         st.snap_task = asyncio.current_task() if loop is not None else None
         st.snap_broken = False
         if loop is not None:
@@ -165,7 +152,7 @@ class ThreadReads:
         self._end_txn(st)
         st.snap_broken = True
 
-    def _snap_exit(self, clean: bool) -> None:
+    def snap_exit(self, clean: bool) -> None:
         st = getattr(self._local, "st", None)
         if st is None:
             return
@@ -203,14 +190,18 @@ class ThreadReads:
 class Snapshot:
     """``with db.snapshot():`` — the block's reads share one fixed view."""
 
-    __slots__ = ("_db",)
+    __slots__ = ("_guard", "_path", "_reads")
 
-    def __init__(self, db: "LiteWriter") -> None:  # noqa: UP037
-        self._db = db
+    def __init__(
+        self, reads: ThreadReads, path: Path, guard: Callable[[], None]
+    ) -> None:
+        self._reads = reads
+        self._path = path
+        self._guard = guard
 
     def __enter__(self) -> None:
-        self._db._require_reader()
-        self._db._reads._snap_enter(self._db.path)
+        self._guard()
+        self._reads.snap_enter(self._path)
 
     def __exit__(self, exc_type: object, exc: BaseException | None, tb: object) -> None:
-        self._db._reads._snap_exit(exc is None)
+        self._reads.snap_exit(exc is None)

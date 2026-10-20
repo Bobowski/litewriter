@@ -14,19 +14,16 @@ subqueries, compounds) never collides and the same shape always renders
 the same ``.sql`` text.
 """
 
-# pyright: reportPrivateUsage=false
-
 import math
 import re
-from collections.abc import Callable, Mapping
-from typing import Any, cast
+from collections.abc import Callable
+from typing import Any
 
 import apsw
 
 from litewriter.errors import QueryError, StateError
-from litewriter.expr import _RESERVED, Expr, _param_name, _Stmt
+from litewriter.expr import NAME, RESERVED, Expr, Params, Stmt, param_name
 
-_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _KEYWORDS = frozenset(word.upper() for word in apsw.keywords)
 
 # Binding strength from https://sqlite.org/lang_expr.html. A child that
@@ -114,17 +111,17 @@ def render(data: dict[str, Any]) -> tuple[str, dict[str, object]]:
 def _render(data: dict[str, Any], ctx: _Ctx) -> str:
     parts: list[str] = []
     _with(data, parts, ctx)
-    kind = data["kind"]
-    if kind == "insert":
-        _insert(data, parts, ctx)
-    elif kind == "update":
-        _update(data, parts, ctx)
-    elif kind == "delete":
-        _delete(data, parts, ctx)
-    elif kind == "compound":
-        _compound(data, parts, ctx)
-    else:
-        _select(data, parts, ctx)
+    match data["kind"]:
+        case "insert":
+            _insert(data, parts, ctx)
+        case "update":
+            _update(data, parts, ctx)
+        case "delete":
+            _delete(data, parts, ctx)
+        case "compound":
+            _compound(data, parts, ctx)
+        case _:
+            _select(data, parts, ctx)
     return " ".join(parts)
 
 
@@ -133,7 +130,7 @@ def _with(data: dict[str, Any], parts: list[str], ctx: _Ctx) -> None:
     if not ctes:
         return
     bits = [
-        f"{_alias(name)} AS ({_render(body._clauses(), ctx)})"
+        f"{_alias(name)} AS ({_render(body.clauses(), ctx)})"
         for name, body in ctes.items()
     ]
     head = "WITH RECURSIVE" if data.get("recursive") else "WITH"
@@ -162,8 +159,8 @@ def _compound(data: dict[str, Any], parts: list[str], ctx: _Ctx) -> None:
     _tail(data, parts, ctx)
 
 
-def _member(stmt: _Stmt, ctx: _Ctx) -> str:
-    data = stmt._clauses()
+def _member(stmt: Stmt, ctx: _Ctx) -> str:
+    data = stmt.clauses()
     stray = [key for key in _TAIL if data.get(key)]
     if stray:
         raise QueryError(
@@ -210,7 +207,7 @@ def _insert(data: dict[str, Any], parts: list[str], ctx: _Ctx) -> None:
         if columns:
             head += " (" + ", ".join(_column(col) for col in columns) + ")"
         parts.append(head)
-        sel = dict(data["select"]._clauses())
+        sel = dict(data["select"].clauses())
         # SQLite reads "ON" after a bare FROM as a join. WHERE TRUE ends it.
         if "on_conflict" in data and not sel.get("where"):
             sel["where"] = [Expr(("raw", "TRUE"))]
@@ -223,7 +220,7 @@ def _insert(data: dict[str, Any], parts: list[str], ctx: _Ctx) -> None:
                 example='Insert("t", columns=["body"])',
             )
         head += " (" + ", ".join(_column(name) for name in columns) + ")"
-        bound = ", ".join(":" + _param_name(name) for name in columns)
+        bound = ", ".join(":" + param_name(name) for name in columns)
         parts.append(f"{head} VALUES ({bound})")
     _conflict(data, parts, ctx)
     _returning(data, parts, ctx)
@@ -329,8 +326,8 @@ def _name(raw: object, ctx: _Ctx) -> str:
     """A name position: the select list, a source, GROUP/ORDER BY, a name."""
     if isinstance(raw, Expr):
         return _node(raw.data, ctx, 0)
-    if isinstance(raw, _Stmt):
-        return f"({_render(raw._clauses(), ctx)})"
+    if isinstance(raw, Stmt):
+        return f"({_render(raw.clauses(), ctx)})"
     if isinstance(raw, str):
         if raw.startswith("'"):
             raise QueryError(
@@ -355,10 +352,9 @@ def _val(raw: object, ctx: _Ctx, parent: int = 0) -> str:
     """A value position: every Python value binds, ``None`` is ``NULL``."""
     if isinstance(raw, Expr):
         return _node(raw.data, ctx, parent)
-    if isinstance(raw, _Stmt):
-        return f"({_render(raw._clauses(), ctx)})"
-    if isinstance(raw, float) and not math.isfinite(raw):
-        raise QueryError("a float literal is finite", context={"value": raw})
+    if isinstance(raw, Stmt):
+        return f"({_render(raw.clauses(), ctx)})"
+    _finite(raw)
     if isinstance(raw, str | bytes | int | float | bool):
         return ctx.bind(raw)
     if raw is None:
@@ -369,14 +365,19 @@ def _val(raw: object, ctx: _Ctx, parent: int = 0) -> str:
     )
 
 
+def _finite(raw: object) -> None:
+    """NaN and infinity raise — the same rule for a literal and a bind."""
+    if isinstance(raw, float) and not math.isfinite(raw):
+        raise QueryError("a float literal is finite", context={"value": raw})
+
+
 def _scalar(raw: object, ctx: _Ctx) -> str:
     if isinstance(raw, bool):
         return "TRUE" if raw else "FALSE"
     if isinstance(raw, int):
         return str(raw)
     if isinstance(raw, float):
-        if not math.isfinite(raw):
-            raise QueryError("a float literal is finite", context={"value": raw})
+        _finite(raw)
         return repr(raw)
     if raw is None:
         return "NULL"
@@ -388,82 +389,74 @@ def _scalar(raw: object, ctx: _Ctx) -> str:
     )
 
 
-def _node(raw: object, ctx: _Ctx, parent: int) -> str:
-    if not isinstance(raw, tuple) or not raw:
-        raise QueryError(
-            "not an expression",
-            context={"expression": raw},
-            example='col("name") == "value"',
-        )
-    data = cast("tuple[Any, ...]", raw)
-    tag = data[0]
-    if tag == "col":
-        return _ident(data[1])
-    if tag == "par":
-        return ":" + data[1]
-    if tag == "lit":
-        return _literal(data[1])
-    if tag == "raw":
-        return data[1]
-    if tag == "neg":
-        return _wrap("- " + _val(data[1], ctx, _UNARY), _UNARY, parent)
-    if tag == "not":
-        return _wrap("NOT " + _val(data[1], ctx, _NOT), _NOT, parent)
-    if tag == "and" or tag == "or":
-        op = tag.upper()
-        own = _PREC[op]
-        text = f" {op} ".join(_val(item, ctx, own) for item in data[1])
-        return _wrap(text, own, parent)
-    if tag == "bin":
-        op = data[1]
-        own = _PREC[op]
-        text = f"{_val(data[2], ctx, own)} {op} {_val(data[3], ctx, own)}"
-        return _wrap(text, own, parent)
-    if tag == "in":
-        left = _val(data[1], ctx, _TEST)
-        items = data[2]
-        if isinstance(items, _Stmt):
-            right = _render(items._clauses(), ctx)
-        else:
-            right = ", ".join(_val(item, ctx) for item in items)
-        op = "NOT IN" if data[3] else "IN"
-        return _wrap(f"{left} {op} ({right})", _TEST, parent)
-    if tag == "btw":
-        left = _val(data[1], ctx, _TEST)
-        low = _val(data[2], ctx, _TEST)
-        high = _val(data[3], ctx, _TEST)
-        op = "NOT BETWEEN" if data[4] else "BETWEEN"
-        return _wrap(f"{left} {op} {low} AND {high}", _TEST, parent)
-    if tag == "case":
-        bits = ["CASE"]
-        for cond, value in data[1]:
-            bits.append(f"WHEN {_val(cond, ctx)} THEN {_val(value, ctx)}")
-        if data[2] is not None:
-            bits.append(f"ELSE {_val(data[2], ctx)}")
-        bits.append("END")
-        return " ".join(bits)
-    if tag == "as":
-        return f"{_val(data[1], ctx)} AS {_alias(data[2])}"
-    if tag == "ord":
-        text = f"{_val(data[2], ctx)} {data[1]}"
-        if data[3] is not None:
-            text += f" {data[3]}"
-        return text
-    if tag == "cast":
-        return f"CAST({_val(data[1], ctx)} AS {data[2]})"
-    if tag == "coll":
-        return _wrap(f"{_val(data[1], ctx, 10)} COLLATE {data[2]}", 10, parent)
-    if tag == "fnc":
-        args = ", ".join(_val(arg, ctx) for arg in data[2])
-        return f"{data[1]}({args})"
-    if tag == "ext":
-        op = "NOT EXISTS" if data[2] else "EXISTS"
-        return f"{op} ({_render(data[1]._clauses(), ctx)})"
-    raise QueryError(
-        "not an expression",
-        context={"expression": data},
-        example='col("name") == "value"',
-    )
+def _node(data: tuple[Any, ...], ctx: _Ctx, parent: int) -> str:
+    match data:
+        case ("col", name):
+            return _ident(name)
+        case ("par", name):
+            return ":" + name
+        case ("lit", text):
+            return _literal(text)
+        case ("raw", sql):
+            return sql
+        case ("neg", item):
+            return _wrap("- " + _val(item, ctx, _UNARY), _UNARY, parent)
+        case ("not", item):
+            return _wrap("NOT " + _val(item, ctx, _NOT), _NOT, parent)
+        case (("and" | "or") as tag, items):
+            op = tag.upper()
+            own = _PREC[op]
+            text = f" {op} ".join(_val(item, ctx, own) for item in items)
+            return _wrap(text, own, parent)
+        case ("bin", op, left, right):
+            own = _PREC[op]
+            text = f"{_val(left, ctx, own)} {op} {_val(right, ctx, own)}"
+            return _wrap(text, own, parent)
+        case ("in", expr, items, negated):
+            left = _val(expr, ctx, _TEST)
+            if isinstance(items, Stmt):
+                right = _render(items.clauses(), ctx)
+            else:
+                right = ", ".join(_val(item, ctx) for item in items)
+            op = "NOT IN" if negated else "IN"
+            return _wrap(f"{left} {op} ({right})", _TEST, parent)
+        case ("btw", expr, low, high, negated):
+            left = _val(expr, ctx, _TEST)
+            low_text = _val(low, ctx, _TEST)
+            high_text = _val(high, ctx, _TEST)
+            op = "NOT BETWEEN" if negated else "BETWEEN"
+            return _wrap(f"{left} {op} {low_text} AND {high_text}", _TEST, parent)
+        case ("case", branches, else_):
+            bits = ["CASE"]
+            for cond, value in branches:
+                bits.append(f"WHEN {_val(cond, ctx)} THEN {_val(value, ctx)}")
+            if else_ is not None:
+                bits.append(f"ELSE {_val(else_, ctx)}")
+            bits.append("END")
+            return " ".join(bits)
+        case ("as", item, name):
+            return f"{_val(item, ctx)} AS {_alias(name)}"
+        case ("ord", direction, item, nulls):
+            text = f"{_val(item, ctx)} {direction}"
+            if nulls is not None:
+                text += f" {nulls}"
+            return text
+        case ("cast", item, type_name):
+            return f"CAST({_val(item, ctx)} AS {type_name})"
+        case ("coll", item, name):
+            return _wrap(f"{_val(item, ctx, 10)} COLLATE {name}", 10, parent)
+        case ("fnc", name, args):
+            bound = ", ".join(_val(arg, ctx) for arg in args)
+            return f"{name}({bound})"
+        case ("ext", stmt, negated):
+            op = "NOT EXISTS" if negated else "EXISTS"
+            return f"{op} ({_render(stmt.clauses(), ctx)})"
+        case _:
+            raise QueryError(
+                "not an expression",
+                context={"expression": data},
+                example='col("name") == "value"',
+            )
 
 
 def _wrap(text: str, own: int, parent: int) -> str:
@@ -476,7 +469,7 @@ def _ident(text: str) -> str:
     for index, part in enumerate(parts):
         if part == "*" and index == len(parts) - 1:
             out.append("*")
-        elif _NAME.fullmatch(part):
+        elif NAME.fullmatch(part):
             out.append(_quote(part))
         else:
             raise QueryError(
@@ -497,7 +490,7 @@ def _literal(text: object) -> str:
 
 
 def _alias(raw: object) -> str:
-    if not isinstance(raw, str) or not _NAME.fullmatch(raw):
+    if not isinstance(raw, str) or not NAME.fullmatch(raw):
         raise QueryError(
             "an alias is a plain name", context={"alias": raw}, example='"author"'
         )
@@ -505,7 +498,7 @@ def _alias(raw: object) -> str:
 
 
 def _column(raw: object) -> str:
-    if not isinstance(raw, str) or not _NAME.fullmatch(raw):
+    if not isinstance(raw, str) or not NAME.fullmatch(raw):
         raise QueryError(
             "a column is a plain name", context={"column": raw}, example='"body"'
         )
@@ -529,7 +522,7 @@ def params_in(text: str) -> frozenset[str]:
     return frozenset(_BINDING.findall(_QUOTED.sub("''", text)))
 
 
-def as_into(into: object) -> Callable[..., Any]:
+def as_into[T](into: Callable[..., T]) -> Callable[..., T]:
     """``into`` builds a row. A non-callable is a caller bug."""
     if not callable(into):
         raise QueryError(
@@ -537,15 +530,15 @@ def as_into(into: object) -> Callable[..., Any]:
             context={"into": into},
             example="db.query(q, Row)",
         )
-    return cast("Callable[..., Any]", into)
+    return into
 
 
-def _split(q: object) -> tuple[str, dict[str, object]]:
+def split(q: object) -> tuple[str, Params]:
     """The SQL text and the statement's auto-bound parameters."""
     if isinstance(q, str):
         return q, {}
-    if isinstance(q, _Stmt):
-        return q._compiled()
+    if isinstance(q, Stmt):
+        return q.compiled()
     raise QueryError(
         "a query is SQL text or a statement",
         context={"query": q},
@@ -553,9 +546,7 @@ def _split(q: object) -> tuple[str, dict[str, object]]:
     )
 
 
-def merge(
-    q: object, call: Mapping[str, object]
-) -> tuple[str, Mapping[str, object] | None]:
+def merge(q: str | Stmt, call: Params) -> tuple[str, Params | None]:
     """The SQL text plus call params merged over the auto-bound ones.
 
     A callable ``into`` kwarg is positional in the public calls, not a
@@ -571,15 +562,15 @@ def merge(
             help_text="A keyword into= becomes a SQL parameter.",
             example="db.query(q, Message, room=1)",
         )
-    if isinstance(q, _Stmt):
+    if isinstance(q, Stmt):
         for key in call:
-            if _RESERVED.fullmatch(key):
+            if RESERVED.fullmatch(key):
                 raise QueryError(
                     "a named parameter is not an auto-bind name",
                     context={"parameter": key},
                     help_text="_1, _2, ... are reserved on builder statements.",
                 )
-    text, auto = _split(q)
+    text, auto = split(q)
     if not auto:
         return text, call or None
     return text, {**auto, **call}
@@ -588,12 +579,11 @@ def merge(
 def run(
     conn: apsw.Connection,
     text: str,
-    bound: Mapping[str, object] | None,
+    bound: Params | None,
 ) -> apsw.Cursor:
     """Run SQL on a connection. A missing ``:name`` raises QueryError."""
     try:
-        bindings = cast("apsw.Bindings | None", bound)
-        return conn.execute(text, bindings)
+        return conn.execute(text, bound)
     except KeyError as exc:
         raise QueryError(
             "missing parameter",
@@ -610,14 +600,14 @@ def run(
         raise StateError("the writer is closed") from None
 
 
-def rows[T](cursor: apsw.Cursor, into: Callable[..., T]) -> list[T]:
+def rows(cursor: apsw.Cursor, into: Callable[..., Any]) -> list[Any]:
     """Every row, each built as ``into(*row)``."""
     if into is tuple:
-        return cast("list[T]", cursor.fetchall())
+        return cursor.fetchall()
     return [into(*row) for row in cursor]
 
 
-def one[T](cursor: apsw.Cursor, into: Callable[..., T]) -> T | None:
+def one(cursor: apsw.Cursor, into: Callable[..., Any]) -> Any:
     """The first row as ``into(*row)``, or None when there is none."""
     try:
         row = cursor.fetchone()
@@ -626,7 +616,7 @@ def one[T](cursor: apsw.Cursor, into: Callable[..., T]) -> T | None:
     if row is None:
         return None
     if into is tuple:
-        return cast("T", row)
+        return row
     return into(*row)
 
 

@@ -17,12 +17,21 @@ import socket
 import weakref
 from asyncio import AbstractEventLoop
 from collections.abc import Callable
+from functools import partial
 from itertools import groupby
 from operator import itemgetter
 from threading import Lock
 from weakref import WeakKeyDictionary
 
 type Wake = Callable[[], None]
+
+
+def running_loop() -> AbstractEventLoop | None:
+    """The event loop running on this thread, if there is one."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
 
 
 def _pair() -> tuple[socket.socket, socket.socket]:
@@ -110,11 +119,7 @@ class _Mailbox:
                 loop.remove_reader(self._in.fileno())
             self._shut()
 
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is loop:
+        if running_loop() is loop:
             detach()
         else:
             try:
@@ -201,17 +206,8 @@ class LoopWakes:
             entry.post(wake)
             return
         entry.append(wake)
-
-        def drain(pending: list[Wake] = entry) -> None:
-            while pending:
-                try:
-                    queued = pending.pop(0)
-                except IndexError:
-                    return
-                queued()
-
         with contextlib.suppress(RuntimeError):
-            loop.call_soon_threadsafe(drain)
+            loop.call_soon_threadsafe(partial(_drain, entry))
 
     def close(self) -> list[tuple[AbstractEventLoop, Wake]]:
         """Detach every mailbox. Return wakes that never reached their loop.
@@ -230,6 +226,20 @@ class LoopWakes:
         return late
 
 
+def _drain(pending: list[Wake]) -> None:
+    while pending:
+        try:
+            queued = pending.pop(0)
+        except IndexError:
+            return
+        queued()
+
+
+def _fire_all(batch: list[Wake]) -> None:
+    for set_it in batch:
+        set_it()
+
+
 def deliver(wakes: LoopWakes, notes: list[tuple[AbstractEventLoop, Wake]]) -> None:
     """Post each watch's wake on its own loop, one post per loop.
 
@@ -239,9 +249,4 @@ def deliver(wakes: LoopWakes, notes: list[tuple[AbstractEventLoop, Wake]]) -> No
     notes.sort(key=lambda note: id(note[0]))
     for loop, group in groupby(notes, key=itemgetter(0)):
         batch = [set_it for _, set_it in group]
-
-        def fire_all(wakes_: list[Wake] = batch) -> None:
-            for set_it in wakes_:
-                set_it()
-
-        wakes.post(loop, fire_all)
+        wakes.post(loop, partial(_fire_all, batch))

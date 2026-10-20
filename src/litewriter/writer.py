@@ -20,8 +20,6 @@ watch tables sit under a lock. That stays true when the GIL is off.
 SQLite's locks. ``close`` drops it after the last commit.
 """
 
-# pyright: reportPrivateUsage=false
-
 import asyncio
 import inspect
 import logging
@@ -31,6 +29,7 @@ from asyncio import Future as AsyncFuture
 from collections.abc import Callable
 from concurrent.futures import Future
 from contextlib import AbstractContextManager, suppress
+from functools import partial
 from pathlib import Path
 from threading import Condition, Event, Thread, current_thread, local
 from typing import Any, Concatenate, overload
@@ -41,13 +40,12 @@ from litewriter.build import Statement
 from litewriter.claim import Claim, claim_path, validate_timeout
 from litewriter.connect import connect
 from litewriter.errors import QueryError, StateError, check_seconds
-from litewriter.inbox import Inbox, Job, _async_write, settle
+from litewriter.inbox import Inbox, Job, async_write_error, settle
 from litewriter.q import as_into, merge, one, rows, run, value
 from litewriter.reads import Snapshot, ThreadReads
-from litewriter.track import Tracker
-from litewriter.tx import Tx, _ended
-from litewriter.wake import LoopWakes
-from litewriter.watch import Watch
+from litewriter.tx import Tx, ended_error
+from litewriter.wake import LoopWakes, running_loop
+from litewriter.watch import Tracker, Watch
 
 type OnError = Callable[[BaseException], None]
 type _Outcome = tuple[Future[Any] | AsyncFuture[Any], object, BaseException | None]
@@ -78,11 +76,14 @@ def _busy_ms(timeout: object) -> int:
 
 def _no_loop(what: str, example: str = "await db.write(fn, ...)") -> None:
     """Refuse to block a running event loop."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
+    if running_loop() is None:
         return
     raise StateError(f"{what} would block the event loop", example=example)
+
+
+def _finish(work: list[_Outcome]) -> None:
+    for future, result, error in work:
+        settle(future, result, error)
 
 
 def _no_wait(what: str) -> None:
@@ -105,7 +106,7 @@ def _write_fn(fn: object) -> None:
             example="def add(tx: Tx) -> int:\n    ...",
         )
     if inspect.iscoroutinefunction(fn):
-        raise _async_write()
+        raise async_write_error()
 
 
 class _WriteFuture[R](Future[R]):
@@ -189,7 +190,7 @@ class LiteWriter:
         self._on_error = _default_error if on_error is None else on_error
         self._inbox: Inbox[Job | None] = Inbox()
         self._wakes = LoopWakes()
-        self._track = Tracker()
+        self._track = Tracker(self._wakes)
         self._committing = False
         self._thread: Thread | None = None
         self._write: apsw.Connection | None = None
@@ -324,11 +325,7 @@ class LiteWriter:
                 closed = StateError("the writer closed before this write ran")
                 self._wake(late, None, closed)
             for loop, wake in self._wakes.close():
-                try:
-                    running = asyncio.get_running_loop()
-                except RuntimeError:
-                    running = None
-                if running is loop:
+                if running_loop() is loop:
                     wake()
                 else:
                     with suppress(RuntimeError):
@@ -378,6 +375,11 @@ class LiteWriter:
         self._require_reader()
         return self._reads.read(self.path)
 
+    def _cursor(self, q: str | Statement, params: dict[str, object]) -> apsw.Cursor:
+        conn = self._conn()
+        text, bound = merge(q, params)
+        return run(conn, text, bound)
+
     def _require_reader(self) -> None:
         """Reads run off the writer thread. Inside a write, use ``tx``."""
         if self._thread is current_thread():
@@ -405,12 +407,7 @@ class LiteWriter:
     ) -> list[Any]:
         """All rows, each built as ``into(*row)``. ``params`` fill ``:name``."""
         into = as_into(into)
-        conn = self._conn()
-        if not params and type(q) is str:
-            text, bound = q, None
-        else:
-            text, bound = merge(q, params)
-        return rows(run(conn, text, bound), into)
+        return rows(self._cursor(q, params), into)
 
     @overload
     def one(
@@ -429,21 +426,11 @@ class LiteWriter:
     ) -> Any:
         """The first row as ``into(*row)``, or None when there is none."""
         into = as_into(into)
-        conn = self._conn()
-        if not params and type(q) is str:
-            text, bound = q, None
-        else:
-            text, bound = merge(q, params)
-        return one(run(conn, text, bound), into)
+        return one(self._cursor(q, params), into)
 
     def value(self, q: str | Statement, /, **params: object) -> Any:
         """The first column of the first row. No row raises QueryError."""
-        conn = self._conn()
-        if not params and type(q) is str:
-            text, bound = q, None
-        else:
-            text, bound = merge(q, params)
-        return value(run(conn, text, bound))
+        return value(self._cursor(q, params))
 
     @overload
     async def aquery(
@@ -495,7 +482,7 @@ class LiteWriter:
         block short — an open snapshot holds back the WAL checkpoint.
         """
         self._require_reader()
-        return Snapshot(self)
+        return Snapshot(self._reads, self.path, self._require_reader)
 
     @overload
     def watch(
@@ -515,7 +502,20 @@ class LiteWriter:
         """The rows now, then again after each commit that changes them."""
         into = as_into(into)
         text, bound = merge(q, params)
-        return Watch(self, text, bound, into)
+        return Watch(
+            self._track,
+            text,
+            bound,
+            into,
+            prepare=self._watch_deps,
+            conn=self._conn,
+        )
+
+    def _watch_deps(
+        self, text: str
+    ) -> tuple[frozenset[str], frozenset[tuple[str, str]]]:
+        self._require_started()
+        return self._dependencies(text)
 
     def _dependencies(
         self, q: str | Statement
@@ -687,7 +687,7 @@ class LiteWriter:
         schema = self._schema
         if schema is None:
             return
-        self._statement(write, "BEGIN IMMEDIATE")
+        write.execute("BEGIN IMMEDIATE")
         try:
             if isinstance(schema, str):
                 for _row in write.execute(schema):
@@ -696,19 +696,19 @@ class LiteWriter:
                 schema(Tx(write))
             self._committing = True
             try:
-                self._statement(write, "COMMIT")
+                write.execute("COMMIT")
             finally:
                 self._committing = False
         except BaseException:
             with suppress(apsw.Error):
-                self._statement(write, "ROLLBACK")
+                write.execute("ROLLBACK")
             raise
 
     def _commit(self, write: apsw.Connection, batch: list[Job]) -> None:
         """One transaction. Every job gets a savepoint and an outcome."""
         results: list[tuple[object, BaseException | None]] = []
         self._track.begin()
-        self._statement(write, "BEGIN IMMEDIATE")
+        write.execute("BEGIN IMMEDIATE")
         try:
             traced = self._track.live()
             before: tuple[int, int] | None = None
@@ -719,31 +719,31 @@ class LiteWriter:
             tx = Tx(write, self._track if traced else None)
             for index, job in enumerate(batch):
                 save = f"j{index}"
-                self._statement(write, f"SAVEPOINT {save}")
+                write.execute(f"SAVEPOINT {save}")
                 mark = self._track.mark() if traced else None
                 try:
                     result = job.run(tx)
                 except BaseException as exc:
                     if not write.in_transaction:
-                        raise _ended() from exc
+                        raise ended_error() from exc
                     if mark is not None:
                         self._track.restore(mark)
-                    self._statement(write, f"ROLLBACK TO {save}")
-                    self._statement(write, f"RELEASE {save}")
+                    write.execute(f"ROLLBACK TO {save}")
+                    write.execute(f"RELEASE {save}")
                     results.append((None, exc))
                     continue
                 if not write.in_transaction:
-                    raise _ended()
-                self._statement(write, f"RELEASE {save}")
+                    raise ended_error()
+                write.execute(f"RELEASE {save}")
                 results.append((result, None))
             self._committing = True
             try:
-                self._statement(write, "COMMIT")
+                write.execute("COMMIT")
             finally:
                 self._committing = False
         except BaseException as exc:
             with suppress(apsw.Error):
-                self._statement(write, "ROLLBACK")
+                write.execute("ROLLBACK")
             self._wake(batch, None, exc)
             return
         try:
@@ -752,7 +752,7 @@ class LiteWriter:
                 after = self._schema_version(write)
                 self._track.seen(after)
                 changed = stale or after != before
-            self._track.notify(changed, traced, self._wakes)
+            self._track.notify(changed, traced)
         except Exception:
             logging.getLogger("litewriter").exception("watch notify failed")
         self._wake(batch, results, None)
@@ -781,13 +781,7 @@ class LiteWriter:
                 continue
             grouped.setdefault(loop, []).append((future, result, error))
         for loop, items in grouped.items():
-            captured = items
-
-            def finish(work: list[_Outcome] = captured) -> None:
-                for future, result, error in work:
-                    settle(future, result, error)
-
-            self._wakes.post(loop, finish)
+            self._wakes.post(loop, partial(_finish, items))
 
     def _schema_version(self, write: apsw.Connection) -> tuple[int, int]:
         """The main and temp schema versions. DDL bumps one of them."""
@@ -797,6 +791,3 @@ class LiteWriter:
             0 if main is None else int(main[0]),
             0 if temp is None else int(temp[0]),
         )
-
-    def _statement(self, write: apsw.Connection, text: str) -> None:
-        write.execute(text)

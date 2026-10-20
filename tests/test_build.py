@@ -14,7 +14,7 @@ from litewriter import (
     lit,
     param,
 )
-from litewriter.build import Compound, JoinSpec, _Join
+from litewriter.build import Compound, JoinKind, JoinSpec
 from litewriter.expr import Expr
 
 
@@ -78,7 +78,7 @@ def test_joins() -> None:
 
 
 def test_join_kind_is_checked() -> None:
-    bad = cast(_Join, "sideways")
+    bad = cast(JoinKind, "sideways")
     with pytest.raises(QueryError, match="join kind"):
         Select("id", from_="t").join(bad, "u", col("a") == col("b"))
     with pytest.raises(QueryError, match="join"):
@@ -213,10 +213,10 @@ def test_an_upsert_from_names() -> None:
 def test_a_compiled_statement_is_shared() -> None:
     q = Update("t", set=["body"], where=col("id") == param("id"))
     assert q.sql is q.sql
-    assert q._compiled() is q._compiled()
+    assert q.compiled() is q.compiled()
     leaked = q.params
     leaked["bogus"] = 1
-    assert q._compiled()[1] == {}
+    assert q.compiled()[1] == {}
 
 
 def test_name_shorthands_are_checked() -> None:
@@ -232,9 +232,9 @@ def test_name_shorthands_are_checked() -> None:
 
 def test_a_none_condition_raises() -> None:
     with pytest.raises(QueryError, match="not None"):
-        Select("id", from_="t", where=None)
+        Select("id", from_="t", where=cast("Expr", None))
     with pytest.raises(QueryError, match="not None"):
-        Select("id", from_="t", having=None)
+        Select("id", from_="t", having=cast("Expr", None))
     with pytest.raises(QueryError, match="not None"):
         Select("id", from_="t", where=[col("id") == 1, cast("Expr", None)])
     with pytest.raises(QueryError, match="not None"):

@@ -15,19 +15,26 @@ A ``Select`` nests anywhere: ``from_=inner.as_("s")``,
 ``col("id").in_(inner)``, ``inner.exists()``.
 """
 
-# pyright: reportPrivateUsage=false
-
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any, Literal, Self, cast
+from enum import Enum, auto
+from typing import Any, Literal, Self, TypeIs
 
 from litewriter.errors import QueryError
-from litewriter.expr import Expr, Name, Value, _param_name, _Stmt
+from litewriter.expr import (
+    Expr,
+    Name,
+    Params,
+    Stmt,
+    Value,
+    is_iter,
+    is_params,
+    is_seq,
+    param_name,
+)
 from litewriter.q import render
 
-type _Join = Literal["inner", "left", "right", "full", "cross"]
+type JoinKind = Literal["inner", "left", "right", "full", "cross"]
 type Cond = Expr | bool
-
-_MISSING: Any = object()
 """One condition: an expression or a Python bool."""
 type JoinSpec = (
     tuple[Literal["inner", "left", "right", "full"], Name, Value]
@@ -38,6 +45,15 @@ _JOINS = frozenset({"inner", "left", "right", "full", "cross"})
 _SELECTABLE = frozenset({"select", "compound"})
 
 
+class _Unset(Enum):
+    """No ``where``/``having`` argument was given."""
+
+    UNSET = auto()
+
+
+_UNSET = _Unset.UNSET
+
+
 def _none_cond() -> QueryError:
     return QueryError(
         "a condition is an expression, not None",
@@ -45,7 +61,7 @@ def _none_cond() -> QueryError:
     )
 
 
-class Statement(_Stmt):
+class Statement(Stmt):
     """Base of the four statements. Immutable: ``.sql`` and ``.params``
     are computed once and cached. Each subclass holds clause data."""
 
@@ -53,12 +69,12 @@ class Statement(_Stmt):
 
     def __init__(self, data: dict[str, Any]) -> None:
         self._data = data
-        self._cache: tuple[str, dict[str, object]] | None = None
+        self._cache: tuple[str, Params] | None = None
 
-    def _clauses(self) -> dict[str, Any]:
+    def clauses(self) -> dict[str, Any]:
         return self._data
 
-    def _compiled(self) -> tuple[str, dict[str, object]]:
+    def compiled(self) -> tuple[str, Params]:
         """The rendered text and auto-bound params: compiled once, no copy."""
         cached = self._cache
         if cached is None:
@@ -69,12 +85,12 @@ class Statement(_Stmt):
     @property
     def sql(self) -> str:
         """The SQL text. Bound values render as ``:_1``, ``:_2``, ..."""
-        return self._compiled()[0]
+        return self.compiled()[0]
 
     @property
     def params(self) -> dict[str, Any]:
         """The auto-bound values behind ``:_1``, ``:_2``, ... A copy."""
-        return dict(self._compiled()[1])
+        return dict(self.compiled()[1])
 
     def as_(self, name: str) -> Expr:
         """This statement as a subquery with an alias: ``(...) AS name``."""
@@ -95,16 +111,16 @@ class _Ctes(Statement):
 
     __slots__ = ()
 
-    def with_(self, name: str, query: _Stmt) -> Self:
+    def with_(self, name: str, query: Stmt) -> Self:
         return self._cte(name, query, recursive=False)
 
-    def with_recursive(self, name: str, query: _Stmt) -> Self:
+    def with_recursive(self, name: str, query: Stmt) -> Self:
         return self._cte(name, query, recursive=True)
 
     def _cte(self, name: str, query: object, *, recursive: bool) -> Self:
         if self._data.get("recursive") != recursive and self._data.get("with"):
             raise QueryError("use with or with_recursive, not both")
-        if not isinstance(query, _Stmt):
+        if not isinstance(query, Stmt):
             raise QueryError(
                 "a CTE body is a statement",
                 context={"query": query},
@@ -122,7 +138,7 @@ class _Where(Statement):
 
     def where(self, *conds: Cond) -> Self:
         """AND each condition onto ``WHERE``. The old statement stays."""
-        rows: list[Any] = list(self._data.get("where") or [])
+        rows: list[object] = list(self._data.get("where") or [])
         rows.extend(conds)
         for cond in rows:
             if cond is None:
@@ -139,7 +155,7 @@ class _From(_Where):
         """``FROM source``. A statement or ``source.as_("name")`` nests."""
         return self._new(**{"from": source})
 
-    def join(self, kind: _Join, source: Name, on: Value = None) -> Self:
+    def join(self, kind: JoinKind, source: Name, on: Value = None) -> Self:
         """Append one join. ``kind`` is inner, left, right, full, or cross."""
         if kind not in _JOINS:
             raise QueryError(
@@ -188,9 +204,9 @@ class Select(_From, _Tail, _Ctes):
         distinct: bool = False,
         from_: Name | None = None,
         join: JoinSpec | list[JoinSpec] | tuple[JoinSpec, ...] | None = None,
-        where: Cond | list[Cond] | tuple[Cond, ...] | None = _MISSING,
+        where: Cond | list[Cond] | tuple[Cond, ...] | _Unset = _UNSET,
         group_by: Name | list[Name] | tuple[Name, ...] | None = None,
-        having: Cond | list[Cond] | tuple[Cond, ...] | None = _MISSING,
+        having: Cond | list[Cond] | tuple[Cond, ...] | _Unset = _UNSET,
         order_by: Name | list[Name] | tuple[Name, ...] | None = None,
         limit: int | Expr | None = None,
         offset: int | Expr | None = None,
@@ -211,11 +227,11 @@ class Select(_From, _Tail, _Ctes):
             data["from"] = from_
         if join is not None:
             data["join"] = _joins(join)
-        if where is not _MISSING:
+        if not isinstance(where, _Unset):
             data["where"] = _conds(where)
         if group_by is not None:
             data["group_by"] = _many(group_by)
-        if having is not _MISSING:
+        if not isinstance(having, _Unset):
             data["having"] = _conds(having)
         if order_by is not None:
             data["order_by"] = _many(order_by)
@@ -239,7 +255,7 @@ class Select(_From, _Tail, _Ctes):
         return self._new(group_by=rows)
 
     def having(self, *conds: Cond) -> Self:
-        rows: list[Any] = list(self._data.get("having") or [])
+        rows: list[object] = list(self._data.get("having") or [])
         rows.extend(conds)
         for cond in rows:
             if cond is None:
@@ -325,20 +341,13 @@ class Insert(_Returning, _Ctes):
             if values is None and select is None:
                 # ``VALUES (:name, ...)``: each column doubles as a parameter.
                 for name in names:
-                    _param_name(name)
+                    param_name(name)
             data["columns"] = names
         if values is not None:
             data["values"] = _valrows(values)
         if select is not None:
-            if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-                select,
-                _Stmt,
-            ) or (select._clauses().get("kind") not in _SELECTABLE):
-                raise QueryError(
-                    "select is a Select",
-                    example='select=Select("id", from_="t")',
-                )
-            sel = select._clauses()
+            member = _select_stmt(select)
+            sel = member.clauses()
             if sel.get("with"):
                 if "with" in data:
                     raise QueryError(
@@ -347,7 +356,7 @@ class Insert(_Returning, _Ctes):
                     )
                 data["with"] = dict(sel["with"])
                 data["recursive"] = bool(sel.get("recursive"))
-            data["select"] = select
+            data["select"] = member
         if on_conflict is not None:
             data["on_conflict"] = _names(on_conflict, "on_conflict")
         if do_nothing:
@@ -399,7 +408,7 @@ class Update(_From, _Returning, _Ctes):
         set: Mapping[str, Value] | str | Sequence[str],
         from_: Name | None = None,
         join: JoinSpec | list[JoinSpec] | tuple[JoinSpec, ...] | None = None,
-        where: Cond | list[Cond] | tuple[Cond, ...] | None = _MISSING,
+        where: Cond | list[Cond] | tuple[Cond, ...] | _Unset = _UNSET,
         returning: Name | list[Name] | tuple[Name, ...] | None = None,
         with_: Mapping[str, Statement] | None = None,
         recursive: bool = False,
@@ -414,7 +423,7 @@ class Update(_From, _Returning, _Ctes):
             data["from"] = from_
         if join is not None:
             data["join"] = _joins(join)
-        if where is not _MISSING:
+        if not isinstance(where, _Unset):
             data["where"] = _conds(where)
         if returning is not None:
             data["returning"] = _many(returning)
@@ -434,14 +443,14 @@ class Delete(_Where, _Returning, _Ctes):
         self,
         table: str | Expr,
         *,
-        where: Cond | list[Cond] | tuple[Cond, ...] | None = _MISSING,
+        where: Cond | list[Cond] | tuple[Cond, ...] | _Unset = _UNSET,
         returning: Name | list[Name] | tuple[Name, ...] | None = None,
         with_: Mapping[str, Statement] | None = None,
         recursive: bool = False,
     ) -> None:
         data: dict[str, Any] = {"kind": "delete", "table": table}
         data.update(_ctes(with_, recursive))
-        if where is not _MISSING:
+        if not isinstance(where, _Unset):
             data["where"] = _conds(where)
         if returning is not None:
             data["returning"] = _many(returning)
@@ -449,25 +458,25 @@ class Delete(_Where, _Returning, _Ctes):
 
 
 def _rowdict(row: object) -> dict[str, object]:
-    if not isinstance(row, Mapping):
+    if not is_params(row):
         raise QueryError(
             "a values row is a dict",
             context={"row": row},
             example='.values({"body": "hi"})',
         )
-    pairs = cast("Mapping[object, object]", row)
-    return {str(key): value for key, value in pairs.items()}
+    return {str(key): value for key, value in row.items()}
 
 
 def _conds(raw: object) -> list[object]:
     """One condition, or a list of conditions joined by AND."""
-    if isinstance(raw, list | tuple):
+    items: list[object]
+    if is_seq(raw):
         if not raw:
             raise QueryError(
                 "a condition list is non-empty",
                 example='where=col("id") == 1',
             )
-        items = list(cast("Iterable[object]", raw))
+        items = list(raw)
     else:
         items = [raw]
     for item in items:
@@ -476,78 +485,79 @@ def _conds(raw: object) -> list[object]:
     return items
 
 
-def _many(raw: object) -> list[object]:
+def _many(raw: Name | list[Name] | tuple[Name, ...]) -> list[Name]:
     """A list is many items. Any other value is one item."""
     if isinstance(raw, list | tuple):
-        return list(cast("Iterable[object]", raw))
+        return list(raw)
     return [raw]
 
 
 def _names(raw: object, key: str) -> list[str]:
     if isinstance(raw, str):
         return [raw]
-    if not isinstance(raw, Iterable):
+    if not is_iter(raw):
         raise QueryError(
             f"{key} is a list of names",
             example=f'{key}=["id"]',
         )
-    return [str(name) for name in cast("Iterable[object]", raw)]
+    return [str(name) for name in raw]
 
 
-def _one_join(raw: object) -> bool:
-    if not isinstance(raw, list | tuple) or not raw:
+def _one_join(raw: object) -> TypeIs[JoinSpec]:
+    if not is_seq(raw) or not raw:
         return False
-    first = cast("list[object] | tuple[object, ...]", raw)[0]
+    first = raw[0]
     return isinstance(first, str) and first in _JOINS
 
 
 def _joins(raw: object) -> list[tuple[object, object, object]]:
     """``join`` is one (kind, source, on) tuple or a list of them."""
     if _one_join(raw):
-        return [_join_item(cast("list[object] | tuple[object, ...]", raw))]
-    if not isinstance(raw, list | tuple):
+        return [_join_item(raw)]
+    if not is_seq(raw):
         raise QueryError(
             "join is (kind, source, on) or a list of joins",
             example='join=("left", "users", col("m.author") == col("u.id"))',
         )
-    return [
-        _join_item(cast("list[object] | tuple[object, ...]", item))
-        for item in cast("Iterable[object]", raw)
-    ]
+    return [_join_item(item) for item in raw]
 
 
-def _join_item(
-    item: list[object] | tuple[object, ...],
-) -> tuple[object, object, object]:
-    kind, rest = item[0], len(item)
-    if kind == "cross":
-        if rest != 2:
+def _join_item(item: object) -> tuple[object, object, object]:
+    if not is_seq(item) or not item:
+        raise QueryError(
+            "join is (kind, source, on) or a list of joins",
+            context={"join": item},
+            example='join=("left", "users", col("m.author") == col("u.id"))',
+        )
+    if item[0] == "cross":
+        if len(item) != 2:
             raise QueryError(
                 'a cross join is ("cross", source)', context={"join": item}
             )
         return ("cross", item[1], None)
-    if rest != 3:
+    if len(item) != 3:
         raise QueryError(
-            f'a {kind} join is ("{kind}", source, on)', context={"join": item}
+            f'a {item[0]} join is ("{item[0]}", source, on)', context={"join": item}
         )
     return (item[0], item[1], item[2])
 
 
-def _assigns(raw: object, what: str, *, excluded: bool) -> dict[str, object]:
+def _assigns(
+    raw: Mapping[str, Value] | str | Sequence[str], what: str, *, excluded: bool
+) -> dict[str, Value]:
     """``set``/``do_update``: a dict, or column names bound as ``:name``."""
     if isinstance(raw, Mapping):
-        pairs = cast("Mapping[object, object]", raw)
-        return {str(key): value for key, value in pairs.items()}
+        return {str(key): value for key, value in raw.items()}
     return _pairs(_names(raw, what), {}, excluded=excluded)
 
 
 def _pairs(
-    columns: Iterable[object], assigns: Mapping[str, object], *, excluded: bool
-) -> dict[str, object]:
+    columns: Iterable[str], assigns: Mapping[str, Value], *, excluded: bool
+) -> dict[str, Value]:
     """``.set``/``.do_update`` args: positional names, then kwarg assigns."""
-    pairs: dict[str, object] = {}
+    pairs: dict[str, Value] = {}
     for name in columns:
-        checked = _param_name(name)
+        checked = param_name(name)
         pairs[checked] = (
             Expr(("col", f"excluded.{checked}")) if excluded else Expr(("par", checked))
         )
@@ -555,17 +565,18 @@ def _pairs(
     return pairs
 
 
-def _valrows(raw: object) -> list[dict[str, object]]:
+def _valrows(
+    raw: Mapping[str, Value] | Sequence[Mapping[str, Value]],
+) -> list[dict[str, object]]:
     """``values`` is one dict or a list of dicts, snapshotted.
 
     An empty dict means ``INSERT INTO t DEFAULT VALUES``.
     """
     if isinstance(raw, Mapping):
-        pairs = cast("Mapping[object, object]", raw)
-        return [{str(key): value for key, value in pairs.items()}]
+        return [{str(key): value for key, value in raw.items()}]
     if isinstance(raw, list | tuple):
         rows: list[dict[str, object]] = []
-        for row in cast("Iterable[object]", raw):
+        for row in raw:
             rows.append(_rowdict(row))
         if not rows:
             raise QueryError(
@@ -588,15 +599,14 @@ def _ctes(raw: object, recursive: bool) -> dict[str, Any]:
                 example='with_={"recent": Select("id", from_="t")}, recursive=True',
             )
         return {}
-    if isinstance(raw, _Stmt) or not isinstance(raw, Mapping) or not raw:
+    if isinstance(raw, Stmt) or not is_params(raw) or not raw:
         raise QueryError(
             "with_ is a dict of name to query",
             example='with_={"recent": Select("id", from_="messages")}',
         )
-    bodies = cast("Mapping[object, object]", raw)
-    ctes: dict[str, object] = {}
-    for name, body in bodies.items():
-        if not isinstance(body, _Stmt):
+    ctes: dict[str, Stmt] = {}
+    for name, body in raw.items():
+        if not isinstance(body, Stmt):
             raise QueryError(
                 "a CTE body is a statement",
                 context={"name": name, "query": body},
@@ -607,9 +617,18 @@ def _ctes(raw: object, recursive: bool) -> dict[str, Any]:
 
 
 def _member_stmt(raw: object) -> Statement:
-    if not isinstance(raw, _Stmt) or (raw._clauses().get("kind") not in _SELECTABLE):
+    if not isinstance(raw, Statement) or (raw.clauses().get("kind") not in _SELECTABLE):
         raise QueryError(
             "a compound member is a Select",
             example='Select("id", from_="a").union(Select("id", from_="b"))',
         )
-    return cast(Statement, raw)
+    return raw
+
+
+def _select_stmt(raw: object) -> Stmt:
+    if not isinstance(raw, Stmt) or raw.clauses().get("kind") not in _SELECTABLE:
+        raise QueryError(
+            "select is a Select",
+            example='select=Select("id", from_="t")',
+        )
+    return raw

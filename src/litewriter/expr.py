@@ -14,19 +14,34 @@ expression has no truth value.
 """
 
 import re
-from collections.abc import Iterable
-from typing import Any, Literal, cast
+from collections.abc import Iterable, Mapping
+from typing import Any, Literal, TypeIs
 
 from litewriter.errors import QueryError
 
-_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-_RESERVED = re.compile(r"_[0-9]+")
+NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+RESERVED = re.compile(r"_[0-9]+")
 """The auto-bind names: ``_1``, ``_2``, ... are reserved."""
 _AUTO_BIND = re.compile(r"[:@$]_[0-9]+\b")
 """A reference to an auto-bind, e.g. ``:_1``, inside raw SQL."""
 
+type Params = Mapping[str, Any]
+"""Named values bound to a query; apsw checks each value."""
 
-class _Stmt:
+
+def is_params(raw: object) -> TypeIs[Params]:
+    return isinstance(raw, Mapping)
+
+
+def is_iter(raw: object) -> TypeIs[Iterable[object]]:
+    return isinstance(raw, Iterable)
+
+
+def is_seq(raw: object) -> TypeIs[list[object] | tuple[object, ...]]:
+    return isinstance(raw, list | tuple)
+
+
+class Stmt:
     """Base of built statements (``Select``, ``Insert``, ...).
 
     A nominal class, not a Protocol: ``isinstance`` against it runs on
@@ -43,17 +58,17 @@ class _Stmt:
     def params(self) -> dict[str, Any]:
         raise NotImplementedError
 
-    def _clauses(self) -> dict[str, Any]:
+    def clauses(self) -> dict[str, Any]:
         raise NotImplementedError
 
-    def _compiled(self) -> tuple[str, dict[str, object]]:
+    def compiled(self) -> tuple[str, Params]:
         raise NotImplementedError
 
 
-type Value = Expr | _Stmt | str | bytes | int | float | bool | None
+type Value = Expr | Stmt | str | bytes | int | float | bool | None
 """Anything a value position accepts."""
 
-type Name = Expr | _Stmt | str
+type Name = Expr | Stmt | str
 """Anything a name position accepts."""
 
 
@@ -107,15 +122,15 @@ class Expr:
         """``expr AS name``."""
         return Expr(("as", self, name))
 
-    def in_(self, values: Iterable[Value] | _Stmt) -> Expr:
+    def in_(self, values: Iterable[Value] | Stmt) -> Expr:
         """``expr IN (...)``. One iterable of values or one Select."""
-        if isinstance(values, _Stmt):
+        if isinstance(values, Stmt):
             return Expr(("in", self, values, False))
         return Expr(("in", self, _items(values, "in_"), False))
 
-    def not_in(self, values: Iterable[Value] | _Stmt) -> Expr:
+    def not_in(self, values: Iterable[Value] | Stmt) -> Expr:
         """``expr NOT IN (...)``. One iterable of values or one Select."""
-        if isinstance(values, _Stmt):
+        if isinstance(values, Stmt):
             return Expr(("in", self, values, True))
         return Expr(("in", self, _items(values, "not_in"), True))
 
@@ -249,7 +264,7 @@ def col(name: str) -> Expr:
 
 def param(name: str) -> Expr:
     """A named parameter. ``param("room")`` renders ``:room``."""
-    return Expr(("par", _param_name(name)))
+    return Expr(("par", param_name(name)))
 
 
 def lit(text: str) -> Expr:
@@ -259,15 +274,17 @@ def lit(text: str) -> Expr:
 
 def raw(sql: str) -> Expr:
     """Verbatim SQL text. ``raw("random()")`` renders ``random()``."""
-    if isinstance(sql, str) and _AUTO_BIND.search(  # pyright: ignore[reportUnnecessaryIsInstance]
-        sql
-    ):
+    _no_auto_bind(sql)
+    return Expr(("raw", sql))
+
+
+def _no_auto_bind(sql: object) -> None:
+    if isinstance(sql, str) and _AUTO_BIND.search(sql):
         raise QueryError(
             "raw() cannot reference an auto-bind name",
             context={"sql": sql},
             help_text="Use param() for a named value.",
         )
-    return Expr(("raw", sql))
 
 
 def case(*pairs: tuple[Value, Value], else_: Value = None) -> Expr:
@@ -280,21 +297,17 @@ def case(*pairs: tuple[Value, Value], else_: Value = None) -> Expr:
             "case needs at least one (condition, value) pair",
             example='case((col("s") == "open", 1), else_=0)',
         )
-    cooked: list[tuple[object, object]] = []
-    for pair in pairs:
-        if (
-            not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-                pair,
-                tuple | list,
-            )
-            or len(pair) != 2
-        ):
-            raise QueryError(
-                "a case branch is a (condition, value) pair",
-                context={"branch": pair},
-            )
-        cooked.append((pair[0], pair[1]))
+    cooked = [_branch(pair) for pair in pairs]
     return Expr(("case", tuple(cooked), else_))
+
+
+def _branch(pair: object) -> tuple[object, object]:
+    if not is_seq(pair) or len(pair) != 2:
+        raise QueryError(
+            "a case branch is a (condition, value) pair",
+            context={"branch": pair},
+        )
+    return pair[0], pair[1]
 
 
 type BuiltinName = Literal[
@@ -442,25 +455,27 @@ name (a registered function) is still accepted."""
 def fn(name: BuiltinName | str, /, *args: Value) -> Expr:
     """``fn("lower", col("x"))`` is ``lower(x)``. Any SQLite function,
     built-in or registered, by name. ``fn("count")`` is ``count()``."""
-    if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-        name, str
-    ) or not _NAME.fullmatch(name):
+    return Expr(("fnc", _fn_name(name), args))
+
+
+def _fn_name(name: object) -> str:
+    if not isinstance(name, str) or not NAME.fullmatch(name):
         raise QueryError(
             "a function name is a name",
             context={"name": name},
             example='fn("lower", col("x"))',
         )
-    return Expr(("fnc", name, args))
+    return name
 
 
 def _items(values: object, method: str) -> tuple[object, ...]:
-    if isinstance(values, str | bytes) or not isinstance(values, Iterable):
+    if isinstance(values, str | bytes) or not is_iter(values):
         raise QueryError(
             f"{method} takes one iterable or one Select",
             context={"values": values},
             example='col("status").in_(["open", "done"])',
         )
-    return tuple(cast("Iterable[object]", values))
+    return tuple(values)
 
 
 def _sides(left: object, right: object, tag: str) -> tuple[object, ...]:
@@ -515,18 +530,18 @@ def _cast_name(value: object) -> str:
 
 
 def _simple_name(value: object, what: str) -> str:
-    if not isinstance(value, str) or not _NAME.fullmatch(value):
+    if not isinstance(value, str) or not NAME.fullmatch(value):
         raise QueryError(
             f"a {what} is a name", context={what: value}, example='"nocase"'
         )
     return value
 
 
-def _param_name(name: object) -> str:
+def param_name(name: object) -> str:
     if (
         not isinstance(name, str)
-        or not _NAME.fullmatch(name)
-        or _RESERVED.fullmatch(name)
+        or not NAME.fullmatch(name)
+        or RESERVED.fullmatch(name)
     ):
         raise QueryError(
             "a parameter is a name",
