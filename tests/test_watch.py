@@ -112,6 +112,29 @@ async def test_an_upsert_wakes_the_updated_column(db: LiteWriter) -> None:
         assert await anext(it) == [(3,)]
 
 
+async def test_an_update_of_the_source_wakes_a_generated_column(
+    db: LiteWriter,
+) -> None:
+    def setup(tx: Tx) -> None:
+        tx.execute(
+            "CREATE TABLE docs (id INTEGER PRIMARY KEY, data TEXT NOT NULL);"
+            "ALTER TABLE docs ADD COLUMN done INTEGER"
+            " GENERATED ALWAYS AS (data->>'done') VIRTUAL;"
+            "INSERT INTO docs(data) VALUES ('{\"done\": false}')"
+        )
+
+    await db.write(setup)
+    async with db.watch("SELECT id FROM docs WHERE done = 1") as live:
+        it = aiter(live)
+        assert await anext(it) == []
+
+        def finish(tx: Tx) -> None:
+            tx.execute("UPDATE docs SET data = json_set(data, '$.done', json('true'))")
+
+        await db.write(finish)
+        assert await asyncio.wait_for(anext(it), 2) == [(1,)]
+
+
 async def test_executemany_wakes_the_watch(db: LiteWriter) -> None:
     async with db.watch("SELECT count(*) FROM t") as live:
         it = aiter(live)

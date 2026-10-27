@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2
+
+- A `watch` that reads a generated column wakes when a commit updates
+  the table. Before, an update of `data` did not wake a watch on
+  `done GENERATED ALWAYS AS (data->>'done')`.
+
 ## 0.3.1
 
 - Internal cleanup, no public API change: the tracker merged into
