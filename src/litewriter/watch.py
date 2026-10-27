@@ -43,6 +43,7 @@ class Tracker:
         "_changed_tables",
         "_effects",
         "_gen",
+        "_generated",
         "_rowids",
         "_schema_seen",
         "_shared",
@@ -60,6 +61,7 @@ class Tracker:
         self._by_column: dict[tuple[str, str], set[int]] = {}
         self._effects: dict[str, _Deps] = {}
         self._gen = 0
+        self._generated: dict[str, frozenset[str]] = {}
         self._rowids: dict[str, str | None] = {}
         self._schema_seen: tuple[int, int] | None = None
         self._shared: dict[object, tuple[int, _Rows]] = {}
@@ -82,6 +84,7 @@ class Tracker:
             self._stopped = False
             self._effects.clear()
             self._rowids.clear()
+            self._generated.clear()
             self._shared.clear()
 
     def check_schema(self, versions: tuple[int, int]) -> bool:
@@ -98,6 +101,7 @@ class Tracker:
             return False
         self._effects.clear()
         self._rowids.clear()
+        self._generated.clear()
         return True
 
     def seen(self, versions: tuple[int, int]) -> None:
@@ -203,10 +207,36 @@ class Tracker:
             alias = self._rowid_alias(write, table)
             if alias is not None:
                 columns.add((table, alias))
+        for table in {table for table, _ in columns}:
+            columns.update(
+                (table, name) for name in self._generated_columns(write, table)
+            )
         found = (frozenset(tables), frozenset(columns))
         if len(self._effects) >= 1024:
             self._effects.clear()
         self._effects[sql] = found
+        return found
+
+    def _generated_columns(self, write: apsw.Connection, table: str) -> frozenset[str]:
+        """The generated columns of ``table``.
+
+        The authorizer reports an update of the source column, not of
+        the columns computed from it. An update of any column of the
+        table counts as a change to each generated column. A watch
+        whose rows stay equal reads again but does not yield.
+        """
+        found = self._generated.get(table)
+        if found is not None:
+            return found
+        try:
+            rows = write.execute(
+                "SELECT name FROM pragma_table_xinfo(?) WHERE hidden IN (2, 3)",
+                (table,),
+            ).fetchall()
+        except apsw.Error:
+            rows = []
+        found = frozenset(str(row[0]) for row in rows)
+        self._generated[table] = found
         return found
 
     def _rowid_alias(self, write: apsw.Connection, table: str) -> str | None:
@@ -256,6 +286,7 @@ class Tracker:
             if schema_changed:
                 self._effects.clear()
                 self._rowids.clear()
+                self._generated.clear()
             if not self._watches:
                 return
             if schema_changed or self._unknown or not traced:
