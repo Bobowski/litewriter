@@ -605,7 +605,7 @@ def _probe(db: LiteWriter, expect: list[tuple[str, ...]], threads: int) -> None:
 def test_each_thread_has_its_own_read_connection(
     bodies: list[str], threads: int
 ) -> None:
-    expect = [(body,) for body in bodies]
+    expect: list[tuple[str, ...]] = [(body,) for body in bodies]
     with TemporaryDirectory() as raw:
         path = Path(raw) / "t.sqlite3"
         running = LiteWriter(path, hz=0, schema=SCHEMA)

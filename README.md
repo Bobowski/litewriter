@@ -96,7 +96,7 @@ On an event loop, `close()` raises `StateError`: it would block the loop while i
 
 **Cancel.** A write cancelled before the writer starts it does not run. A write cancelled after that still commits.
 
-**Pacing.** With `hz=60` (the default) the writer waits out the rest of 1/60 s after each commit, so the next batch is larger. A write waits at most one period. An idle writer sleeps and does not spin. `hz=0` commits as soon as work arrives. Awaited in sequence, each write waits one period: 30 `await db.write` calls at `hz=60` take about half a second. Put related changes in one write function, or `asyncio.gather` them.
+**Pacing.** With `hz=60` (the default) the writer paces only under load. When more writes wait after a commit, the writer waits out the rest of 1/60 s, so the next batch is larger. A write waits at most one period. When no write waits, the next write commits at once. Thus writes awaited in sequence do not wait for the period. An idle writer sleeps and does not spin. `hz=0` never waits.
 
 ## Reads
 

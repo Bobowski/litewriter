@@ -1,6 +1,6 @@
 [project]
 name = "litewriter"
-version = "0.3.2"
+version = "0.3.3"
 description = "One SQLite writer thread, live queries, and a small builder."
 readme = "README.md"
 requires-python = ">=3.14"
@@ -46,7 +46,7 @@ litewriter = ["py.typed"]
 [dependency-groups]
 dev = [
     "hypothesis>=6.130",
-    "pyright>=1.1.403",
+    "pyrefly>=1.4",
     "pytest>=8.4.1",
     "pytest-asyncio>=1.3.0",
     "ruff>=0.12.8",
@@ -60,14 +60,11 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 
-[tool.pyright]
-pythonVersion = "3.14"
-typeCheckingMode = "basic"
-reportPrivateUsage = false
-reportMissingTypeStubs = false
-strict = ["src"]
-include = ["src", "tests"]
-exclude = ["**/.venv", "**/__pycache__", "benchmarks"]
+[tool.pyrefly]
+python-version = "3.14"
+project-includes = ["src", "tests"]
+project-excludes = ["**/.venv", "**/__pycache__", "benchmarks"]
+search-path = ["src", "tests"]
 
 [tool.ruff]
 target-version = "py314"

@@ -20,5 +20,5 @@ jobs:
           python-version: "3.14"
       - run: uv sync
       - run: uv run ruff check src tests
-      - run: uv run pyright
+      - run: uv run pyrefly check
       - run: uv run pytest
