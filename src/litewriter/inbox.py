@@ -91,6 +91,11 @@ class Inbox[T = Job | None]:
             self._items.clear()
             return batch
 
+    def waiting(self) -> bool:
+        """True when an item is already queued."""
+        with self._cond:
+            return bool(self._items)
+
     def close(self) -> list[T]:
         """Refuse new items. Return the items that never ran."""
         with self._cond:

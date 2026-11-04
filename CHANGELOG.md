@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.3
+
+- The writer paces only under load. A write that arrives when no other
+  write waits commits at once. Before, each write awaited in sequence
+  waited out the rest of the period: 30 writes at `hz=60` took about
+  half a second. Now they take a few milliseconds.
+
 ## 0.3.2
 
 - A `watch` that reads a generated column wakes when a commit updates

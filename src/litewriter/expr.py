@@ -205,10 +205,10 @@ class Expr:
             "an expression has no truth value. Use & for AND, | for OR, ~ for NOT."
         )
 
-    def __eq__(self, other: object) -> Expr:  # pyright: ignore[reportIncompatibleMethodOverride]
+    def __eq__(self, other: object) -> Expr:  # pyrefly: ignore[bad-override]
         return _cmp("=", self, other)
 
-    def __ne__(self, other: object) -> Expr:  # pyright: ignore[reportIncompatibleMethodOverride]
+    def __ne__(self, other: object) -> Expr:  # pyrefly: ignore[bad-override]
         return _cmp("!=", self, other)
 
     def __lt__(self, other: object) -> Expr:

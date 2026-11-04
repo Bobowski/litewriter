@@ -26,6 +26,34 @@ def test_hz(tmp_path: Path) -> None:
         LiteWriter(tmp_path / "b.sqlite3", hz=-5)
 
 
+async def test_awaited_writes_skip_the_pace(tmp_path: Path) -> None:
+    async with LiteWriter(tmp_path / "t.sqlite3", hz=10, schema=SCHEMA) as db:
+        start = time.monotonic()
+        for i in range(5):
+            await db.write(insert, f"row {i}")
+        # Paced, five writes would take four periods: 0.4 s.
+        assert time.monotonic() - start < 0.2
+
+
+def test_a_waiting_write_keeps_the_pace(tmp_path: Path) -> None:
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold(_tx: object) -> None:
+        holding.set()
+        release.wait(timeout=2)
+
+    with LiteWriter(tmp_path / "t.sqlite3", hz=10, schema=SCHEMA) as db:
+        db.push(hold)
+        assert holding.wait(2)
+        held = time.monotonic()
+        waiting = db.submit(insert, "after")
+        release.set()
+        waiting.result(timeout=2)
+        # The write waited behind a commit, so it waits out the period.
+        assert time.monotonic() - held >= 0.08
+
+
 def test_start_required(tmp_path: Path) -> None:
     writer = LiteWriter(tmp_path / "t.sqlite3", hz=0)
     with pytest.raises(StateError, match="start"):
@@ -348,24 +376,38 @@ def test_a_failing_schema_stays_stopped(tmp_path: Path) -> None:
     other.close()
 
 
-def test_hz_caps_commit_rate(tmp_path: Path) -> None:
+def test_hz_caps_commit_rate_under_load(tmp_path: Path) -> None:
     writer = LiteWriter(tmp_path / "hz.sqlite3", hz=50, schema=SCHEMA)
     writer.start()
     # The first commit opens the file. Later commits show the floor.
     writer.submit(insert, "warm").result(timeout=2.0)
     ticks: list[float] = []
+    stop = time.monotonic() + 0.15
 
     def ticked(tx: Tx, body: str) -> int:
         ticks.append(time.monotonic())
         return insert(tx, body)
 
-    for i in range(4):
-        writer.submit(ticked, str(i)).result(timeout=2.0)
+    def produce() -> None:
+        while time.monotonic() < stop:
+            writer.push(ticked, "load")
+            time.sleep(0.0005)
+
+    producers = [threading.Thread(target=produce) for _ in range(4)]
+    for thread in producers:
+        thread.start()
+    for thread in producers:
+        thread.join()
     writer.close()
-    gaps = [b - a for a, b in pairwise(ticks)]
-    # 50 Hz leaves about 20 ms between batch starts. A slow file
-    # system adds time, so assert the lower bound only.
-    assert min(gaps) >= 0.015
+    # Jobs in one batch run back to back. A new batch starts after a gap.
+    starts = [b for a, b in pairwise(ticks) if b - a > 0.005]
+    gaps = [b - a for a, b in pairwise([ticks[0], *starts])]
+    # 50 Hz leaves about 20 ms between batch starts while writes wait.
+    # When the load starts or stops, the inbox can be empty after a
+    # commit, so one or two gaps may be short. A slow file system adds
+    # time, so assert the lower bound only.
+    assert len(gaps) >= 3
+    assert sorted(gaps)[2] >= 0.015
 
 
 def test_the_writer_thread_is_named(tmp_path: Path) -> None:
@@ -606,7 +648,7 @@ async def test_an_async_write_function_raises(db: LiteWriter) -> None:
         return tx.value("SELECT 1")
 
     with pytest.raises(QueryError, match="async def"):
-        await db.write(add)
+        await db.write(add)  # pyrefly: ignore[unused-coroutine]
     with pytest.raises(QueryError, match="async def"):
         db.submit(add)
     with pytest.raises(QueryError, match="async def"):
@@ -631,7 +673,7 @@ async def test_a_write_returning_a_coroutine_fails_only_that_caller(
             bad = asyncio.create_task(db.write(lambda _tx: coro()))
         await good
         with pytest.raises(QueryError, match="async def"):
-            await bad
+            await bad  # pyrefly: ignore[unused-coroutine]
         gc.collect()
     assert db.value("SELECT count(*) FROM t") == 1
     assert not [

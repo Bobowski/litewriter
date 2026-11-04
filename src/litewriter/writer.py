@@ -672,7 +672,10 @@ class LiteWriter:
                     self._wake(batch, None, exc)
                 period = 0.0 if self._hz == 0 else 1.0 / self._hz
                 deadline = started + period
-                if period > 0 and deadline > time.monotonic():
+                # Pace only under load: a write that arrives on an idle
+                # writer commits at once, so awaited writes do not each
+                # wait out the floor.
+                if period > 0 and deadline > time.monotonic() and self._inbox.waiting():
                     # Await the pace, not the clock: ``_stop`` sets the
                     # event so ``close`` never waits out the floor.
                     self._pace.wait(max(0.0, deadline - time.monotonic()))
