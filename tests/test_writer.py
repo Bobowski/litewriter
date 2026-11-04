@@ -382,32 +382,26 @@ def test_hz_caps_commit_rate_under_load(tmp_path: Path) -> None:
     # The first commit opens the file. Later commits show the floor.
     writer.submit(insert, "warm").result(timeout=2.0)
     ticks: list[float] = []
-    stop = time.monotonic() + 0.15
+    done = threading.Event()
 
-    def ticked(tx: Tx, body: str) -> int:
+    def ticked(tx: Tx, n: int) -> int:
+        # Each write queues the next one, so a write always waits when
+        # its batch commits.
         ticks.append(time.monotonic())
-        return insert(tx, body)
+        if n < 4:
+            writer.push(ticked, n + 1)
+        else:
+            done.set()
+        return insert(tx, str(n))
 
-    def produce() -> None:
-        while time.monotonic() < stop:
-            writer.push(ticked, "load")
-            time.sleep(0.0005)
-
-    producers = [threading.Thread(target=produce) for _ in range(4)]
-    for thread in producers:
-        thread.start()
-    for thread in producers:
-        thread.join()
+    writer.push(ticked, 0)
+    assert done.wait(2.0)
     writer.close()
-    # Jobs in one batch run back to back. A new batch starts after a gap.
-    starts = [b for a, b in pairwise(ticks) if b - a > 0.005]
-    gaps = [b - a for a, b in pairwise([ticks[0], *starts])]
-    # 50 Hz leaves about 20 ms between batch starts while writes wait.
-    # When the load starts or stops, the inbox can be empty after a
-    # commit, so one or two gaps may be short. A slow file system adds
-    # time, so assert the lower bound only.
-    assert len(gaps) >= 3
-    assert sorted(gaps)[2] >= 0.015
+    gaps = [b - a for a, b in pairwise(ticks)]
+    # 50 Hz leaves about 20 ms between batch starts while a write waits.
+    # A slow file system adds time, so assert the lower bound only.
+    assert len(gaps) == 4
+    assert min(gaps) >= 0.015
 
 
 def test_the_writer_thread_is_named(tmp_path: Path) -> None:
